@@ -43,13 +43,13 @@ DETAILED_PARENT_MAP = {
     "HSPC": [
         "Averaged.Detailed.HSC_MPP.predscore",
         "Averaged.Detailed.GMP.predscore",
-        "Averaged.Detailed.EoBaMaP.predscore",
         "Averaged.Detailed.Pre-Pro-B.predscore",
-        "Averaged.Detailed.MkP.predscore",
         "Averaged.Detailed.MEP.predscore",
         "Averaged.Detailed.Pro-B.predscore",
     ],
     "Erythroid": [
+        "Averaged.Detailed.HSC_MPP.predscore",
+        "Averaged.Detailed.MEP.predscore",
         "Averaged.Detailed.ErP.predscore",
         "Averaged.Detailed.Erythroblast.predscore",
     ],

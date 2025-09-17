@@ -47,23 +47,24 @@ from .constants import (
     DETAILED_PARENT_MAP,
 )
 
-# --------------------------------------------------------------------- small utility
+# near the other imports in annotation.py
+from .prediction import EXCLUDE_ATLAS
 
-def _join_obs_cols(adata: AnnData, mapping: dict[str, np.ndarray]) -> None:
-    """Add many columns to adata.obs at once to avoid fragmentation."""
-    if not mapping:
-        return
-    df_new = pd.DataFrame(mapping, index=adata.obs.index)
-    adata.obs = pd.concat([adata.obs, df_new], axis=1)
+def _filter_atlases_for_label_local(atlases, depth, label, *, apply_exclusions: bool = True):
+    if not apply_exclusions:
+        return list(atlases)
+    banned = EXCLUDE_ATLAS.get(depth, {}).get(label, set())
+    return [a for a in atlases if a not in banned]
 
-# --------------------------------------------------------------------- utilities
 
 def _is_mosaic_sample(x: Any) -> bool:
     return hasattr(x, "protein") and hasattr(x.protein, "row_attrs") and hasattr(x.protein, "get_attribute")
 
+
 def _class_from_key(k: str) -> str:
     parts = str(k).split(".")
     return parts[-2] if len(parts) >= 3 and parts[-1] == "predscore" else ""
+
 
 def _clr_fallback(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     X = np.asarray(X, dtype=float)
@@ -71,7 +72,6 @@ def _clr_fallback(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     logs = np.log(X + eps)
     return logs - logs.mean(axis=1, keepdims=True)
 
-# --------------------------------------------------------------------- normalise & scale
 
 def Normalise_protein_data(
     data,
@@ -140,6 +140,7 @@ def Normalise_protein_data(
         "Input must be a MissionBio Sample (protein.layers['read_counts']), AnnData, numpy array, DataFrame, or sparse."
     )
 
+
 def _nsp_then_clr(X: np.ndarray, jitter: float, random_state: int, scale: Optional[float]) -> np.ndarray:
     try:
         from missionbio.demultiplex.protein.nsp import NSP
@@ -154,6 +155,7 @@ def _nsp_then_clr(X: np.ndarray, jitter: float, random_state: int, scale: Option
     Xn = _clr_fallback(X)
     print("[Normalise_protein_data] Applied CLR normalization (fallback)")
     return Xn
+
 
 def Scale_protein_data(data, inplace: bool = True):
     """StandardScaler on normalized protein data."""
@@ -203,7 +205,6 @@ def Scale_protein_data(data, inplace: bool = True):
         return pd.DataFrame(scaled, index=df_index, columns=df_columns)
     return scaled
 
-# --------------------------------------------------------------------- voting
 
 def _make_meta_from_row_attrs(sample, needed_cols):
     df_scaled = sample.protein.get_attribute("Scaled_reads", constraint="row+col")
@@ -219,6 +220,7 @@ def _make_meta_from_row_attrs(sample, needed_cols):
                 obs[col] = v
     return ad.AnnData(X=np.zeros((len(idx), 0), dtype=float), obs=obs, var=pd.DataFrame(index=[]))
 
+
 def _write_obs_to_row_attrs(sample, adata_meta, cols):
     for c in cols:
         if c not in adata_meta.obs.columns:
@@ -227,6 +229,7 @@ def _write_obs_to_row_attrs(sample, adata_meta, cols):
         arr = vals.astype(str).to_numpy() if pd.api.types.is_categorical_dtype(vals) else np.asarray(vals.to_numpy())
         sample.protein.row_attrs[c] = arr
 
+
 def _runtime_class_map(class_map: Dict[str, List[str]], cols_available: set) -> Dict[str, List[str]]:
     out = {lbl: [c for c in cols if c in cols_available] for lbl, cols in class_map.items()}
     out = {lbl: cols for lbl, cols in out.items() if cols}
@@ -234,8 +237,10 @@ def _runtime_class_map(class_map: Dict[str, List[str]], cols_available: set) -> 
         raise KeyError("No matching predscore columns found for any class in the provided class_map.")
     return out
 
+
 def _runtime_parent_subset(parent_map: Dict[str, List[str]], cols_available: set) -> Dict[str, List[str]]:
     return {p: [c for c in cols if c in cols_available] for p, cols in parent_map.items()}
+
 
 def voting_annotator(
     obj: Union["AnnData", object],
@@ -255,44 +260,47 @@ def voting_annotator(
 
     if is_anndata:
         n = obj.n_obs
-        pending: dict[str, np.ndarray] = {}
-        def has_key(k: str) -> bool: return (k in obj.obs.columns) or (k in pending)
-        def get_vec(k: str) -> np.ndarray:
-            if k in pending:
-                return pending[k]
-            return obj.obs[k].to_numpy()
-        def set_vec(k: str, v: np.ndarray): pending[k] = v
-        def list_keys() -> List[str]: return list(set(obj.obs.columns).union(pending.keys()))
+
+        def has_key(k: str) -> bool: return k in obj.obs.columns
+        def get_vec(k: str) -> np.ndarray: return obj.obs[k].to_numpy()
+        def set_vec(k: str, v: np.ndarray): obj.obs[k] = v
+        def list_keys() -> List[str]: return list(obj.obs.columns)
     else:
         df_scaled = obj.protein.get_attribute("Scaled_reads", constraint="row+col")
         if not isinstance(df_scaled, pd.DataFrame):
             df_scaled = pd.DataFrame(df_scaled)
         n = len(df_scaled.index)
+
         def has_key(k: str) -> bool: return k in obj.protein.row_attrs
         def get_vec(k: str) -> np.ndarray: return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
         def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v)
         def list_keys() -> List[str]: return list(obj.protein.row_attrs.keys())
 
-    # --- average or copy sources into <level_name>.<class>.predscore ---
-    for out_cls, cols in class_to_sources.items():
+    all_single = True
+    for _, cols in class_to_sources.items():
         present = [c for c in cols if has_key(c)]
-        if not present:
-            continue
-        mats = [get_vec(c).reshape(-1) for c in present if get_vec(c).shape[0] == n]
-        if mats:
-            avg = np.mean(np.vstack(mats), axis=0)
-            set_vec(f"{level_name}.{out_cls}.predscore", avg)
+        if len(present) != 1:
+            all_single = False
+            break
 
-    # 🔑 flush pending into obj.obs/row_attrs before reading them back
-    if is_anndata and pending:
-        _join_obs_cols(obj, pending)
-        pending.clear()
+    if all_single:
+        for out_cls, cols in class_to_sources.items():
+            src = [c for c in cols if has_key(c)][0]
+            set_vec(f"{level_name}.{out_cls}.predscore", get_vec(src))
+    else:
+        for out_cls, cols in class_to_sources.items():
+            present = [c for c in cols if has_key(c)]
+            if present:
+                mats = [get_vec(c) for c in present]
+                mats = [m.reshape(-1) for m in mats if m.shape[0] == n]
+                if mats:
+                    avg = np.mean(np.vstack(mats), axis=0)
+                    set_vec(f"{level_name}.{out_cls}.predscore", avg)
 
     score_cols = [k for k in list_keys() if k.startswith(f"{level_name}.") and k.endswith(".predscore")]
     if not score_cols:
         return
 
-    # build matrix of predscores
     rows = []
     for k in score_cols:
         v = get_vec(k)
@@ -349,10 +357,6 @@ def voting_annotator(
     set_vec(f"{level_name}.Celltype.TopScore", winner_scores)
     set_vec(f"{level_name}.Celltype.LowConf", (winner_scores < conf_threshold).astype(bool))
 
-    if is_anndata:
-        _join_obs_cols(obj, pending)
-
-# --------------------------------------------------------------------- Averaged annotators
 
 def Broad_Annotation(adata_or_sample, conf_threshold: float = 0.75):
     """Broad (Mature/Immature) from Averaged.Broad.*."""
@@ -382,6 +386,7 @@ def Broad_Annotation(adata_or_sample, conf_threshold: float = 0.75):
             raise KeyError(f"[Broad] Missing required column in adata.obs: {k}")
     voting_annotator(adata, level_name, REF, conf_threshold=conf_threshold)
     return adata
+
 
 def Simplified_Annotation(adata_or_sample, conf_threshold: float = 0.75):
     """Constrained Simplified from Averaged.Simplified.* gated by Averaged.Broad.Celltype."""
@@ -430,6 +435,7 @@ def Simplified_Annotation(adata_or_sample, conf_threshold: float = 0.75):
     )
     return adata
 
+
 def Detailed_Annotation(adata_or_sample, conf_threshold: float = 0.6):
     """Constrained Detailed from Averaged.Detailed.* gated by Averaged.Simplified.Celltype."""
     level_name = "Averaged.Detailed"
@@ -477,22 +483,25 @@ def Detailed_Annotation(adata_or_sample, conf_threshold: float = 0.6):
     )
     return adata
 
-# --------------------------------------------------------------------- Atlas-specific maps & annotators
 
 _SIMPLIFIED_NAMES: List[str] = list(SIMPLIFIED_CLASSES.keys())
 _DETAILED_NAMES:   List[str] = list(DETAILED_CLASSES.keys())
 
+
 def _build_simplified_classmap_for(atlas: str) -> dict[str, list[str]]:
     return {lbl: [f"{atlas}.Simplified.{lbl}.predscore"] for lbl in _SIMPLIFIED_NAMES}
 
+
 def _build_detailed_classmap_for(atlas: str) -> dict[str, list[str]]:
     return {lbl: [f"{atlas}.Detailed.{lbl}.predscore"] for lbl in _DETAILED_NAMES}
+
 
 def _build_simplified_parentmap_for(atlas: str) -> dict[str, list[str]]:
     return {
         "Immature": [f"{atlas}.Simplified.HSPC.predscore"],
         "Mature":   [f"{atlas}.Simplified.{l}.predscore" for l in _SIMPLIFIED_NAMES if l != "HSPC"],
     }
+
 
 def _build_detailed_parentmap_for(atlas: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
@@ -504,6 +513,7 @@ def _build_detailed_parentmap_for(atlas: str) -> dict[str, list[str]]:
                 cls_names.append(parts[-2])
         out[parent] = [f"{atlas}.Detailed.{c}.predscore" for c in cls_names]
     return out
+
 
 def Atlas_Broad_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 0.75):
     """Broad (Mature/Immature) from <Atlas>.Broad.*."""
@@ -531,6 +541,7 @@ def Atlas_Broad_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 
         if k not in adata.obs: raise KeyError(f"[{level_name}] Missing required column in adata.obs: {k}")
     voting_annotator(adata, level_name, REF, conf_threshold=conf_threshold)
     return adata
+
 
 def Atlas_Simplified_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 0.75):
     """Constrained Simplified from <Atlas>.Simplified.* gated by <Atlas>.Broad.Celltype."""
@@ -587,6 +598,7 @@ def Atlas_Simplified_Annotation(adata_or_sample, atlas: str, conf_threshold: flo
     adata.obs[f"{atlas}.Simplified.Celltype.LowConf"]  = adata.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
     return adata
 
+
 def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 0.6):
     """Constrained Detailed from <Atlas>.Detailed.* gated by <Atlas>.Simplified.Celltype."""
     con_level = f"{atlas}.Constrained.Detailed"
@@ -642,9 +654,9 @@ def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float
     adata.obs[f"{atlas}.Detailed.Celltype.LowConf"]  = adata.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
     return adata
 
-# --------------------------------------------------------------------- Averaged-track builder
 
 _ATLAS_RE = re.compile(r"^(?P<atlas>[^.]+)\.(?P<level>Broad|Simplified|Detailed)\.(?P<class>[^.]+)\.predscore$")
+
 
 def add_Averaged_tracks(
     obj: Union["AnnData", object],
@@ -655,8 +667,9 @@ def add_Averaged_tracks(
     out_prefix: str = "Averaged.",
     write_atlas_name: bool = True,
     atlas_name_value: str = "avg",
+    apply_exclusions: bool = True,   # NEW
 ) -> None:
-    """Average per-atlas predscores into Averaged.* tracks (ignoring legacy 'Atlas.*')."""
+    """Average per-atlas predscores into Averaged.* tracks (now respecting EXCLUDE_ATLAS)."""
     is_anndata = isinstance(obj, AnnData)
     is_sample = _is_mosaic_sample(obj)
     if not (is_anndata or is_sample):
@@ -667,7 +680,7 @@ def add_Averaged_tracks(
         index = obj.obs.index
         def has_key(k: str) -> bool: return (k in obj.obs.columns) or (k in pending)
         def get_vec(k: str) -> np.ndarray: return pending.get(k, obj.obs[k].to_numpy())
-        def set_vec(k: str, v: np.ndarray): pending[k] = v
+        def set_vec(k: str, v: np.ndarray): pending[k] = np.asarray(v).ravel()
         def list_keys() -> List[str]:
             base = [c for c in obj.obs.columns if not str(c).startswith("Atlas.")]
             extra = [c for c in pending.keys() if not str(c).startswith("Atlas.")]
@@ -679,7 +692,7 @@ def add_Averaged_tracks(
         index = df_scaled.index.astype(str)
         def has_key(k: str) -> bool: return k in obj.protein.row_attrs
         def get_vec(k: str) -> np.ndarray: return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
-        def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v)
+        def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v).ravel()
         def list_keys() -> List[str]: return [c for c in obj.protein.row_attrs.keys() if not str(c).startswith("Atlas.")]
 
     n = len(index)
@@ -701,7 +714,9 @@ def add_Averaged_tracks(
         weights = {k: float(v) for k, v in weights.items() if k in atlases}
 
     for (level, klass), atlas_cols in by_level_class.items():
-        present = [a for a in atlases if a in atlas_cols]
+        # apply exclusions here
+        allowed = _filter_atlases_for_label_local(atlases, level, klass, apply_exclusions=apply_exclusions)
+        present = [a for a in allowed if a in atlas_cols]
         if not present:
             continue
 
@@ -769,13 +784,13 @@ def add_Averaged_tracks(
         set_vec(f"{out_prefix}{level}.pred", pred)
         set_vec(f"{out_prefix}{level}.conf", conf)
 
-    if is_anndata:
+    if is_anndata and pending:
         _join_obs_cols(obj, pending)
 
-# --------------------------------------------------------------------- cleanup / coercion helpers
 
 _LEGACY_ATLAS_COL = re.compile(r"^Atlas\.([^.]+)\.(Broad|Simplified|Detailed)\.([^.]+)\.predscore$")
 _UNWEIGHTED_AVG   = re.compile(r"^Averaged\.Unweighted\.")
+
 
 def _coerce_legacy_atlas_prefix(obj: Union[AnnData, Any]) -> None:
     """
@@ -784,7 +799,6 @@ def _coerce_legacy_atlas_prefix(obj: Union[AnnData, Any]) -> None:
     """
     if isinstance(obj, AnnData):
         keys = list(obj.obs.columns)
-        pending: dict[str, np.ndarray] = {}
         for k in keys:
             m = _LEGACY_ATLAS_COL.match(str(k))
             if not m:
@@ -792,9 +806,7 @@ def _coerce_legacy_atlas_prefix(obj: Union[AnnData, Any]) -> None:
             atlas, level, klass = m.group(1), m.group(2), m.group(3)
             newk = f"{atlas}.{level}.{klass}.predscore"
             if newk not in obj.obs.columns:
-                pending[newk] = obj.obs[k].to_numpy()
-        if pending:
-            _join_obs_cols(obj, pending)
+                obj.obs[newk] = obj.obs[k].to_numpy()
         drop = [c for c in obj.obs.columns if str(c).startswith("Atlas.")]
         if drop:
             obj.obs.drop(columns=drop, inplace=True, errors="ignore")
@@ -814,6 +826,7 @@ def _coerce_legacy_atlas_prefix(obj: Union[AnnData, Any]) -> None:
             except Exception:
                 pass
 
+
 def _drop_unweighted_averaged(obj: Union[AnnData, Any]) -> None:
     """Remove all 'Averaged.Unweighted.*' tracks."""
     if isinstance(obj, AnnData):
@@ -827,21 +840,16 @@ def _drop_unweighted_averaged(obj: Union[AnnData, Any]) -> None:
             except Exception:
                 pass
 
+
 def _ensure_averaged_level_preds(obj, levels=("Broad", "Simplified", "Detailed")) -> None:
     """
     Create Averaged.<level>.pred and Averaged.<level>.conf from existing
     Averaged.<level>.*.predscore columns.
     """
     is_adata = isinstance(obj, AnnData)
-    if is_adata:
-        pending: dict[str, np.ndarray] = {}
-        get_all_keys = (lambda: list(obj.obs.columns))
-        get_vec = (lambda k: obj.obs[k].to_numpy())
-        set_vec = (lambda k, v: pending.__setitem__(k, v))
-    else:
-        get_all_keys = (lambda: list(obj.protein.row_attrs.keys()))
-        get_vec = (lambda k: np.asarray(obj.protein.row_attrs[k]))
-        set_vec = (lambda k, v: obj.protein.row_attrs.__setitem__(k, np.asarray(v)))
+    get_all_keys = (lambda: list(obj.obs.columns)) if is_adata else (lambda: list(obj.protein.row_attrs.keys()))
+    get_vec = (lambda k: obj.obs[k].to_numpy()) if is_adata else (lambda k: np.asarray(obj.protein.row_attrs[k]))
+    set_vec = (lambda k, v: obj.obs.__setitem__(k, v)) if is_adata else (lambda k, v: obj.protein.row_attrs.__setitem__(k, np.asarray(v)))
 
     keys = get_all_keys()
     for level in levels:
@@ -862,13 +870,10 @@ def _ensure_averaged_level_preds(obj, levels=("Broad", "Simplified", "Detailed")
         set_vec(f"Averaged.{level}.pred", pred)
         set_vec(f"Averaged.{level}.conf", conf)
 
-    if is_adata:
-        _join_obs_cols(obj, pending)
-
-# --------------------------------------------------------------------- orchestrator
 
 _ATLAS_SCORE_RE = re.compile(r"^[^.]+\.(Broad|Simplified|Detailed)\.[^.]+\.predscore$")
 _AVG_SCORE_RE   = re.compile(r"^Averaged\.(Broad|Simplified|Detailed)\.[^.]+\.predscore$")
+
 
 def annotate_data(
     obj,
@@ -911,25 +916,21 @@ def annotate_data(
 
         obj = generate_predictions(obj, models_path=models_path, data_path=data_path)
 
-    # Coalesce legacy + cleanup
     _coerce_legacy_atlas_prefix(obj)
     _drop_unweighted_averaged(obj)
 
-    # If per-atlas exist but Averaged.* don't, build them from per-atlas
     now_keys = list(obj.obs.columns) if isinstance(obj, AnnData) else list(obj.protein.row_attrs.keys())
     if not any(_AVG_SCORE_RE.match(str(k)) for k in now_keys):
         print("[annotate_data] Averaged.* predscores missing; creating via add_Averaged_tracks...")
-        add_Averaged_tracks(obj, atlases=atlases)
+        add_Averaged_tracks(obj, atlases=atlases, apply_exclusions=True)  # pass flag
 
-    # Always materialize Averaged winners
+
     _ensure_averaged_level_preds(obj, levels=("Broad", "Simplified", "Detailed"))
 
-    # Constrained Averaged labels
     Broad_Annotation(obj)
     Simplified_Annotation(obj)
     Detailed_Annotation(obj)
 
-    # Per-atlas constrained labels when that atlas has preds present
     present_keys = set(list(obj.obs.columns)) if isinstance(obj, AnnData) else set(list(obj.protein.row_attrs.keys()))
     for atlas in atlases:
         if f"{atlas}.Broad.Mature.predscore" in present_keys and f"{atlas}.Broad.Immature.predscore" in present_keys:
@@ -939,13 +940,8 @@ def annotate_data(
         if f"{atlas}.Detailed.CD14_Mono.predscore" in present_keys or any(k.startswith(f"{atlas}.Detailed.") and k.endswith(".predscore") for k in present_keys):
             Atlas_Detailed_Annotation(obj, atlas, conf_threshold=0.60)
 
-    # Final de-fragmentation pass on AnnData
-    if isinstance(obj, AnnData):
-        obj.obs = obj.obs.copy()
-
     return obj
 
-# --------------------------------------------------------------------- QC / refinement / maintenance
 
 def _get_matrix_for_embedding(
     obj: Union["AnnData", Any],
@@ -969,9 +965,10 @@ def _get_matrix_for_embedding(
             df = pd.DataFrame(df)
         X = df.values.astype(float)
         n_comp = min(n_pca, X.shape[1]) if X.shape[1] > 1 else 1
-        return X.reshape(-1, 1) if n_comp <= 1 else PCA(n_components=n_pca, random_state=0).fit_transform(X)  # fallback PCA
+        return X.reshape(-1, 1) if n_comp <= 1 else PCA(n_components=n_comp, random_state=0).fit_transform(X)
     else:
         raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
+
 
 def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
     """Remove annotation-related columns and extraneous prob matrices."""
@@ -1014,6 +1011,7 @@ def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
 
     return obj
 
+
 def mark_mixed_clusters(
     obj: Union["AnnData", any],
     label_col: str,
@@ -1029,7 +1027,6 @@ def mark_mixed_clusters(
     if not (is_anndata or is_sample):
         raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
 
-    # --- cluster ids per cell ---
     if is_anndata:
         if cluster_col is None:
             for cand in ("leiden", "louvain", "clusters", "cluster"):
@@ -1042,7 +1039,6 @@ def mark_mixed_clusters(
     else:
         clusters = np.asarray(obj.protein.get_labels()).astype(str)
 
-    # --- per-cell labels to overwrite ---
     if is_anndata:
         if label_col not in obj.obs.columns:
             raise KeyError(f"'{label_col}' not in adata.obs")
@@ -1056,7 +1052,6 @@ def mark_mixed_clusters(
         labels_s = pd.Series(labels_arr.astype(str))
         was_cat = False
 
-    # --- composition per cluster ---
     df = pd.DataFrame({"cluster": clusters, "label": labels_s.values})
     counts = df.groupby(["cluster", "label"]).size().rename("count").reset_index()
     totals = df.groupby("cluster").size().rename("total").reset_index()
@@ -1085,6 +1080,7 @@ def mark_mixed_clusters(
     obj.protein.row_attrs[label_col] = np.asarray(updated.values, dtype=object)
     return obj
 
+
 def refine_labels_by_knn_consensus(
     obj: Union["AnnData", any],
     label_col: str = "Averaged.Detailed.Celltype",
@@ -1108,7 +1104,6 @@ def refine_labels_by_knn_consensus(
 
     out_col = out_col or f"{label_col}_refined_consensus"
 
-    # --- Get embedding + labels ---
     if is_anndata:
         if embedding_key not in obj.obsm:
             raise KeyError(f"Embedding '{embedding_key}' not found in adata.obsm")
@@ -1134,11 +1129,9 @@ def refine_labels_by_knn_consensus(
     n = X.shape[0]
     k = max(2, min(k_neighbors, n - 1))
 
-    # --- Frequent labels (eligible targets) ---
     counts = labels_s.value_counts()
     frequent = set(counts[counts >= min_label_size].index)
 
-    # --- Robust z from current centroids (gate outliers) ---
     z = np.full(n, np.nan, dtype=float)
     for lab, idx_lab in labels_s.groupby(labels_s).groups.items():
         idx_arr = np.fromiter(idx_lab, dtype=int)
@@ -1151,11 +1144,10 @@ def refine_labels_by_knn_consensus(
         z_vals = (d - med) / (1.4826 * mad)
         z[idx_arr] = z_vals
 
-    # --- KNN neighbor label distributions ---
     nn = NearestNeighbors(n_neighbors=k + 1, metric="euclidean")
     nn.fit(X)
     dists, neigh = nn.kneighbors(X, return_distance=True)
-    neigh = neigh[:, 1:]  # drop self
+    neigh = neigh[:, 1:]
     neigh = neigh[:, :k]
 
     neigh_labels = labels_s.iloc[neigh.reshape(-1)].to_numpy().reshape(n, -1)
@@ -1234,7 +1226,6 @@ def refine_labels_by_knn_consensus(
             per_label_changes = src_series.value_counts().astype(int).to_dict()
         return int(len(final_idx)), obj.obs[out_col], obj, per_label_changes
 
-    # MissionBio sample: write row_attrs and return the sample
     obj.protein.row_attrs[out_col] = np.asarray(new_labels.values, dtype=object)
     if debug_cols:
         obj.protein.row_attrs[f"{out_col}__knn_top_frac"] = top_frac.astype(float)
@@ -1245,6 +1236,7 @@ def refine_labels_by_knn_consensus(
             flip_vec[np.asarray(final_idx, dtype=int)] = True
         obj.protein.row_attrs[f"{out_col}__flip"] = flip_vec
     return obj
+
 
 def score_mixed_clusters(
     obj: Union["AnnData", Any],
@@ -1328,6 +1320,7 @@ def score_mixed_clusters(
 
     df["mixed_likelihood"] = w_e * df["mix_from_entropy"].values + w_s * df["mix_from_sil"].values
     return df.sort_values("mixed_likelihood", ascending=False)
+
 
 def mark_small_clusters(
     obj: Union["AnnData", Any],
