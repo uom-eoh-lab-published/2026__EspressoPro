@@ -257,7 +257,10 @@ def voting_annotator(
         n = obj.n_obs
         pending: dict[str, np.ndarray] = {}
         def has_key(k: str) -> bool: return (k in obj.obs.columns) or (k in pending)
-        def get_vec(k: str) -> np.ndarray: return pending.get(k, obj.obs[k].to_numpy())
+        def get_vec(k: str) -> np.ndarray:
+            if k in pending:
+                return pending[k]
+            return obj.obs[k].to_numpy()
         def set_vec(k: str, v: np.ndarray): pending[k] = v
         def list_keys() -> List[str]: return list(set(obj.obs.columns).union(pending.keys()))
     else:
@@ -270,34 +273,26 @@ def voting_annotator(
         def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v)
         def list_keys() -> List[str]: return list(obj.protein.row_attrs.keys())
 
-    # Fast path when each class has exactly one present source
-    all_single = True
-    for _, cols in class_to_sources.items():
+    # --- average or copy sources into <level_name>.<class>.predscore ---
+    for out_cls, cols in class_to_sources.items():
         present = [c for c in cols if has_key(c)]
-        if len(present) != 1:
-            all_single = False
-            break
+        if not present:
+            continue
+        mats = [get_vec(c).reshape(-1) for c in present if get_vec(c).shape[0] == n]
+        if mats:
+            avg = np.mean(np.vstack(mats), axis=0)
+            set_vec(f"{level_name}.{out_cls}.predscore", avg)
 
-    if all_single:
-        for out_cls, cols in class_to_sources.items():
-            src = [c for c in cols if has_key(c)][0]
-            set_vec(f"{level_name}.{out_cls}.predscore", get_vec(src))
-    else:
-        for out_cls, cols in class_to_sources.items():
-            present = [c for c in cols if has_key(c)]
-            if present:
-                mats = [get_vec(c) for c in present]
-                mats = [m.reshape(-1) for m in mats if m.shape[0] == n]
-                if mats:
-                    avg = np.mean(np.vstack(mats), axis=0)
-                    set_vec(f"{level_name}.{out_cls}.predscore", avg)
+    # 🔑 flush pending into obj.obs/row_attrs before reading them back
+    if is_anndata and pending:
+        _join_obs_cols(obj, pending)
+        pending.clear()
 
     score_cols = [k for k in list_keys() if k.startswith(f"{level_name}.") and k.endswith(".predscore")]
     if not score_cols:
-        if is_anndata:
-            _join_obs_cols(obj, pending)
         return
 
+    # build matrix of predscores
     rows = []
     for k in score_cols:
         v = get_vec(k)
