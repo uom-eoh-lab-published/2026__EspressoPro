@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Prediction/scoring utilities (with scaling) and consensus-weighted atlas blending."""
+"""Prediction/scoring utilities (with scaling) and consensus (mean/weighted) atlas blending."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ from .core import (
     load_models,
 )
 from .constants import SIMPLIFIED_CLASSES, _DETAILED_LABELS
+
+# ----------------------------- helpers -----------------------------
 
 def _dense(arr):
     return arr.toarray() if sp.issparse(arr) else np.asarray(arr)
@@ -224,6 +226,8 @@ def _resolve_training_columns(
         return cols
     return _get_shared_features_atlas_only(atlas, data_path, shared_feats_cache)
 
+# ------------------------ feature overlap audit ------------------------
+
 def audit_feature_overlap(
     obj: Union["AnnData", Any],
     models_path: Optional[Union[str, Path]] = None,
@@ -298,7 +302,6 @@ def _preview_query_df(df: pd.DataFrame, *, n_rows: int = 5, n_cols: int = 12, ta
     n_cells, n_feats = df.shape
     print(f"[generate_predictions] {tag} shape: {n_cells} cells x {n_feats} features")
     cols_preview = list(df.columns[:min(n_cols, n_feats)])
-    print(f"[generate_predictions] first {len(cols_preview)} columns: {cols_preview}")
     try:
         print(df.loc[df.index[:n_rows], cols_preview].to_string())
     except Exception:
@@ -379,6 +382,8 @@ def _prune_existing_tracks(
             except Exception:
                 pass
 
+# ------------------------ main prediction entry ------------------------
+
 def generate_predictions(
     obj: Union["AnnData", Any],
     models_path: Optional[Union[str, Path]] = None,
@@ -391,7 +396,9 @@ def generate_predictions(
     show_rescaling: bool = True,
     add_consensus: bool = True,
     consensus_prefix: str = "Averaged.",
-    consensus_normalize: bool = True,
+    consensus_normalize: bool = False,    # keep plain scores unless you need multiclass norm
+    consensus_mode: str = "plain",        # 'plain' | 'global' | 'row' | 'hybrid'
+    lambda_global: float = 0.5,           # for 'hybrid'
     add_unweighted: bool = False,
     unweighted_prefix: str = "Averaged.Unweighted.",
     unweighted_normalize: bool = True,
@@ -400,7 +407,7 @@ def generate_predictions(
 ) -> Union["AnnData", Any]:
     """
     Predict OvR scores with optional scaling; write per-atlas probabilities (no 'Atlas.' prefix).
-    If multiple atlases are used, also write Averaged.* (consensus); unweighted averaging disabled by default.
+    If multiple atlases are used, also write Averaged.* (consensus blend; default = row-wise plain mean).
     Additionally creates per-atlas summary columns:
         <Atlas>.<Depth>.pred
         <Atlas>.<Depth>.conf
@@ -611,6 +618,8 @@ def generate_predictions(
                     depths=("Broad", "Simplified", "Detailed"),
                     out_prefix=consensus_prefix,
                     apply_exclusions=use_exclusions,
+                    consensus_mode=consensus_mode,
+                    lambda_global=lambda_global,
                 )
             else:
                 add_consensus_weighted_tracks_sample(
@@ -620,6 +629,8 @@ def generate_predictions(
                     depths=("Broad", "Simplified", "Detailed"),
                     out_prefix=consensus_prefix,
                     apply_exclusions=use_exclusions,
+                    consensus_mode=consensus_mode,
+                    lambda_global=lambda_global,
                 )
 
         if add_unweighted:
@@ -643,6 +654,8 @@ def generate_predictions(
                 )
 
     return obj
+
+# -------------------- locality score (unchanged) --------------------
 
 def _local_dispersion(vals: np.ndarray, coords: np.ndarray, k: int = 15, p: int = 2, eps: float = 1e-9) -> np.ndarray:
     tree = KDTree(coords, metric="minkowski", p=p)
@@ -682,22 +695,95 @@ def _best_localised_score(
             best_med, best_vec, best_atl = med, x, atl
     return best_atl, best_vec
 
+# -------------------- public: add best-localised tracks --------------------
+
+def add_best_localised_tracks(
+    obj: Union["AnnData", Any],
+    *,
+    atlases: Sequence[str],
+    depths: Sequence[str] = ("Broad",),
+    labels: Optional[Sequence[str]] = None,
+    q: float = 0.90,
+    k: int = 15,
+    p: int = 2,
+    prefix: str = "Best",
+) -> None:
+    """Pick, per label, the atlas whose high-score cells are most spatially localized on UMAP.
+
+    Writes columns like 'Best<Depth>.<Label>.predscore' copied from the best atlas' predscore.
+    Requires obj to have UMAP coords at .obsm['X_umap'] (for AnnData), or for MissionBio samples,
+    coords in sample.protein.row_attrs['umap'].
+    """
+    depth_to_labels: Dict[str, Sequence[str]] = {
+        "Broad": ["Immature", "Mature"],
+        "Simplified": list(SIMPLIFIED_CLASSES.keys()),
+        "Detailed": _DETAILED_LABELS,
+    }
+
+    is_anndata = (AnnData is not None and isinstance(obj, AnnData))
+    is_sample  = hasattr(obj, "protein") and hasattr(obj.protein, "row_attrs")
+
+    if is_anndata:
+        if "X_umap" not in obj.obsm:
+            raise ValueError("add_best_localised_tracks requires adata.obsm['X_umap']")
+        for depth in depths:
+            lbls = list(labels) if labels is not None else list(depth_to_labels.get(depth, []))
+            for lbl in lbls:
+                best_atl, _ = _best_localised_score(obj, depth, lbl, atlases, q=q, k=k, p=p)
+                if not best_atl:
+                    continue
+                src = f"{best_atl}.{depth}.{lbl}.predscore"
+                if src in obj.obs:
+                    out = f"{prefix}{depth}.{lbl}.predscore"
+                    obj.obs[out] = obj.obs[src].astype(float).to_numpy()
+
+    elif is_sample:
+        # Build a minimal AnnData view if UMAP coords are available in the sample
+        coords = None
+        for key in ("umap", "X_umap", "umap_coords"):
+            if key in obj.protein.row_attrs:
+                coords = np.asarray(obj.protein.row_attrs[key])
+                break
+        if coords is None:
+            raise ValueError("add_best_localised_tracks requires sample.protein.row_attrs['umap'] (or 'X_umap')")
+        n = int(coords.shape[0])
+        adata = AnnData(X=np.zeros((n, 1)))
+        adata.obsm["X_umap"] = coords
+        # mirror per-atlas columns into adata.obs for scoring
+        for depth in depths:
+            lbls = list(labels) if labels is not None else list(depth_to_labels.get(depth, []))
+            for lbl in lbls:
+                for atl in atlases:
+                    key = f"{atl}.{depth}.{lbl}.predscore"
+                    if key in obj.protein.row_attrs:
+                        adata.obs[key] = np.asarray(obj.protein.row_attrs[key], dtype=float)
+            # choose best and write back
+            for lbl in lbls:
+                best_atl, _ = _best_localised_score(adata, depth, lbl, atlases, q=q, k=k, p=p)
+                if not best_atl:
+                    continue
+                src = f"{best_atl}.{depth}.{lbl}.predscore"
+                if src in obj.protein.row_attrs:
+                    out = f"{prefix}{depth}.{lbl}.predscore"
+                    obj.protein.row_attrs[out] = np.asarray(obj.protein.row_attrs[src], dtype=float)
+    else:
+        raise ValueError("Unsupported object type for add_best_localised_tracks")
+
+# -------------------- atlas exclusions (Broad has none) --------------------
+
 EXCLUDE_ATLAS: Dict[str, Dict[str, set]] = {
-    "Broad": {
-        "Immature": {"Triana", "Luecken"},
-        "Mature":   {"Triana", "Luecken"},
-    },
     "Simplified": {
         "CD4_T":   {"Hao", "Zhang"},
         "CD8_T":   {"Hao", "Zhang"},
+        "Other_T":   {"Luecken"},
         "Erythroid": {"Triana", "Hao"},
         "HSPC":    {"Zhang", "Luecken", "Hao"},
-        "Monocyte": {"Zhang", "Luecken", "Hao"},
+        "Monocyte": {"Zhang"},
         "Myeloid": {"Zhang"},
-        "NK":      {"Hao", "Zhang"},
-        "cDC":     {"Luecken"},
-        "B":       {"Zhang"},
-        "Plasma":  {"Hao", "Zhang"},
+        "NK":      {"Zhang"},
+        "cDC":     {"Luecken", "Zhang"},
+        "B":       {"Hao", "Triana"},
+        "Plasma":  {"Hao", "Zhang", "Triana"},
     },
     "Detailed": {
         "Erythroblast": {"Hao", "Triana", "Zhang"},
@@ -749,8 +835,13 @@ def _stack_label_scores(
     M = np.column_stack([adata.obs[c].astype(float).to_numpy() for c in cols])
     return M, used
 
+# -------------------- weighting helpers --------------------
+
 def _global_agreement_weights(M: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    """Atlas-level reliability weights from cross-atlas agreement."""
+    """
+    Atlas-level reliability weights from cross-atlas agreement.
+    Returns a length-A vector (A = #atlases) with sum=1.
+    """
     A = M.shape[1]
     if A <= 1:
         return np.ones(A, dtype=float)
@@ -765,10 +856,14 @@ def _global_agreement_weights(M: np.ndarray, eps: float = 1e-9) -> np.ndarray:
         return np.ones(A, dtype=float) / A
     return (w / w.sum()).astype(float)
 
-def _row_robust_weights(row: np.ndarray, eps: float = 1e-9, alpha: float = 1.0, hard_tau: float = 4.0) -> np.ndarray:
-    """Per-cell robust weights against outlier atlases."""
-    if row.size == 0:
-        return np.zeros(0, dtype=float)
+def _row_robust_weights(row: np.ndarray, eps: float = 1e-9, alpha: float = 2.0, hard_tau: float = 4.0) -> np.ndarray:
+    """
+    Per-cell robust weights against outlier atlases based on MAD from the row median.
+    Returns a length-A vector with sum=1 (unless row is constant → uniform).
+    """
+    A = row.size
+    if A <= 1:
+        return np.ones(A, dtype=float)
     med = np.median(row)
     dev = np.abs(row - med)
     mad = np.median(dev) + eps
@@ -778,50 +873,78 @@ def _row_robust_weights(row: np.ndarray, eps: float = 1e-9, alpha: float = 1.0, 
     s = soft.sum()
     return soft if s == 0 else (soft / s)
 
-def _consensus_blend(M: np.ndarray, eps: float = 1e-9, z_cut: float = 3.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Blend atlas scores with global + per-cell robust weights; return (consensus, agreement)."""
+# -------------------- consensus blender + writers --------------------
+
+def _consensus_blend(
+    M: np.ndarray,
+    eps: float = 1e-9,
+    mode: str = "plain",          # 'plain' | 'global' | 'row' | 'hybrid'
+    lambda_global: float = 0.5,   # only for 'hybrid'
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Blend atlas scores across columns to a single consensus per cell.
+    - mode='plain':   simple row-wise mean (default; matches naive /A).
+    - mode='global':  same weights for all cells from cross-atlas agreement.
+    - mode='row':     per-cell robust weights (down-weight outliers per row).
+    - mode='hybrid':  convex combo of global and row weights.
+    Returns:
+      consensus: (n,) vector
+      agreement: MAD-based agreement score in [0,1] (higher is better agreement)
+    """
     n, A = M.shape
     if A == 0:
         return np.zeros(n, dtype=float), np.zeros(n, dtype=float)
     if A == 1:
-        return M[:, 0].copy(), np.ones(n, dtype=float)
+        cons = M[:, 0].astype(float).copy()
+        agree = np.ones(n, dtype=float)
+        return cons, agree
 
-    w_global = _global_agreement_weights(M)
-    consensus = np.zeros(n, dtype=float)
-    agree     = np.zeros(n, dtype=float)
+    M = np.clip(M.astype(float), 0.0, 1.0)
 
-    for i in range(n):
-        row = np.asarray(M[i, :], dtype=float)
-        med = np.median(row)
-        mad = np.median(np.abs(row - med)) + eps
-        z = np.abs(row - med) / (1.4826 * mad + eps)
-        inlier_mask = (z <= z_cut)
-        w_row = _row_robust_weights(row, alpha=2.0, hard_tau=None)
-        w = w_global * w_row
-        w[~inlier_mask] = 0.0
-        ws = w.sum()
+    if mode == "plain":
+        cons = M.mean(axis=1)
 
-        if int(inlier_mask.sum()) == 0 or ws <= eps:
-            consensus[i] = float(med)
-            agree[i] = float(np.clip(1.0 - 2.0 * (mad), 0.0, 1.0))
-            continue
+    elif mode == "global":
+        wg = _global_agreement_weights(M, eps=eps)
+        cons = (M * wg[None, :]).sum(axis=1)
 
-        w = w / ws
-        consensus[i] = float((w * row).sum())
-        agree[i] = float(np.clip(1.0 - 2.0 * (mad), 0.0, 1.0))
+    elif mode == "row":
+        cons = np.empty(n, dtype=float)
+        for i in range(n):
+            wr = _row_robust_weights(M[i, :], eps=eps)
+            cons[i] = float((wr * M[i, :]).sum())
 
-    return consensus, agree
+    elif mode == "hybrid":
+        wg = _global_agreement_weights(M, eps=eps)
+        lam = float(np.clip(lambda_global, 0.0, 1.0))
+        cons = np.empty(n, dtype=float)
+        for i in range(n):
+            wr = _row_robust_weights(M[i, :], eps=eps)
+            w = lam * wg + (1.0 - lam) * wr
+            ws = w.sum()
+            cons[i] = float((w * M[i, :]).sum() / (ws if ws > 0 else 1.0))
+    else:
+        raise ValueError("mode must be one of: 'plain', 'global', 'row', 'hybrid'")
+
+    # agreement: 1 - 2*MAD(row) clipped to [0,1]
+    med = np.median(M, axis=1)
+    mad = np.median(np.abs(M - med[:, None]), axis=1)
+    agree = np.clip(1.0 - 2.0 * mad, 0.0, 1.0)
+
+    return cons.astype(float), agree.astype(float)
 
 def add_consensus_weighted_tracks(
     adata: AnnData,
     *,
     atlases: Sequence[str],
-    normalize_multiclass: bool = True,
+    normalize_multiclass: bool = False,  # default False to preserve the mean
     depths: Sequence[str] = ("Broad", "Simplified", "Detailed"),
     out_prefix: str = "Averaged.",
     apply_exclusions: bool = True,
+    consensus_mode: str = "plain",        # NEW
+    lambda_global: float = 0.5,           # NEW
 ) -> None:
-    """Consensus-weighted Averaged.* tracks; passthrough if single atlas and exclusions disabled."""
+    """Consensus Averaged.* tracks (plain/weighted) across atlases, respecting exclusions."""
     depth_to_labels: Dict[str, Sequence[str]] = {
         "Broad": ["Immature", "Mature"],
         "Simplified": list(SIMPLIFIED_CLASSES.keys()),
@@ -855,14 +978,19 @@ def add_consensus_weighted_tracks(
             if M.shape[1] == 0:
                 continue
             M = np.clip(M, 0.0, 1.0)
-            cons, agree = _consensus_blend(M)
+            # Force unweighted mean specifically for Averaged.Broad.Immature.predscore
+            if depth == "Broad" and lbl == "Immature":
+                cons, agree = _consensus_blend(M, mode="plain", lambda_global=lambda_global)
+            else:
+                cons, agree = _consensus_blend(M, mode=consensus_mode, lambda_global=lambda_global)
 
             adata.obs[pred_col] = cons
             adata.obs[agr_col]  = agree
             adata.obs[nat_col]  = int(M.shape[1])
             created_cols.append(pred_col)
 
-        if normalize_multiclass and created_cols:
+        # For Broad, keep plain means (no renormalization)
+        if depth != "Broad" and normalize_multiclass and created_cols:
             X = adata.obs[created_cols].to_numpy(dtype=float)
             X = np.clip(X, 0.0, 1.0)
             rs = X.sum(axis=1, keepdims=True)
@@ -873,12 +1001,14 @@ def add_consensus_weighted_tracks_sample(
     sample,
     *,
     atlases: Sequence[str],
-    normalize_multiclass: bool = True,
+    normalize_multiclass: bool = False,
     depths: Sequence[str] = ("Broad", "Simplified", "Detailed"),
     out_prefix: str = "Averaged.",
     apply_exclusions: bool = True,
+    consensus_mode: str = "plain",        # NEW
+    lambda_global: float = 0.5,           # NEW
 ) -> None:
-    """Sample variant of consensus-weighted Averaged.* tracks."""
+    """Sample variant of consensus Averaged.* tracks."""
     depth_to_labels: Dict[str, Sequence[str]] = {
         "Broad": ["Immature", "Mature"],
         "Simplified": list(SIMPLIFIED_CLASSES.keys()),
@@ -919,7 +1049,11 @@ def add_consensus_weighted_tracks_sample(
             if not cols:
                 continue
             M = np.clip(np.column_stack(cols), 0.0, 1.0)
-            cons, agree = _consensus_blend(M)
+            # Force unweighted mean specifically for Averaged.Broad.Immature.predscore
+            if depth == "Broad" and lbl == "Immature":
+                cons, agree = _consensus_blend(M, mode="plain", lambda_global=lambda_global)
+            else:
+                cons, agree = _consensus_blend(M, mode=consensus_mode, lambda_global=lambda_global)
 
             sample.protein.row_attrs[pred_key] = cons.astype(float)
             sample.protein.row_attrs[agr_key]  = agree.astype(float)
@@ -927,13 +1061,15 @@ def add_consensus_weighted_tracks_sample(
             created.append(pred_key)
             label_vecs.append(cons.reshape(-1))
 
-        if normalize_multiclass and created:
+    if normalize_multiclass and created and depth != "Broad":
             X = np.clip(np.column_stack(label_vecs).astype(float), 0.0, 1.0)
             rs = X.sum(axis=1, keepdims=True)
             rs[rs <= 0.0] = 1.0
             Xn = X / rs
             for j, key in enumerate(created):
                 sample.protein.row_attrs[key] = Xn[:, j].astype(float)
+
+# -------------------- legacy "unweighted" (kept) --------------------
 
 def add_unweighted_average_tracks(
     adata: AnnData,
@@ -944,7 +1080,7 @@ def add_unweighted_average_tracks(
     out_prefix: str = "Averaged.Unweighted.",
     apply_exclusions: bool = True,
 ) -> None:
-    """Unweighted Averaged.* tracks; passthrough if single atlas and exclusions disabled."""
+    """Unweighted Averaged.* tracks (row-wise mean); retained for backward compatibility."""
     depth_to_labels: Dict[str, Sequence[str]] = {
         "Broad": ["Immature", "Mature"],
         "Simplified": list(SIMPLIFIED_CLASSES.keys()),
@@ -981,7 +1117,8 @@ def add_unweighted_average_tracks(
             adata.obs[nat_col]  = int(M.shape[1])
             created_cols.append(pred_col)
 
-        if normalize_multiclass and created_cols:
+    # For Broad, keep plain means (no renormalization)
+    if depth != "Broad" and normalize_multiclass and created_cols:
             X = adata.obs[created_cols].to_numpy(dtype=float)
             X = np.clip(X, 0.0, 1.0)
             rs = X.sum(axis=1, keepdims=True)
@@ -997,7 +1134,7 @@ def add_unweighted_average_tracks_sample(
     out_prefix: str = "Averaged.Unweighted.",
     apply_exclusions: bool = True,
 ) -> None:
-    """Sample variant of unweighted averaging."""
+    """Sample variant of unweighted averaging (row-wise mean); retained for backward compatibility."""
     depth_to_labels: Dict[str, Sequence[str]] = {
         "Broad": ["Immature", "Mature"],
         "Simplified": list(SIMPLIFIED_CLASSES.keys()),
@@ -1046,37 +1183,11 @@ def add_unweighted_average_tracks_sample(
             created_keys.append(pred_key)
             label_vecs.append(cons.reshape(-1))
 
-        if normalize_multiclass and created_keys:
+        # For Broad, keep plain means (no renormalization)
+        if depth != "Broad" and normalize_multiclass and created_keys:
             X = np.clip(np.column_stack(label_vecs).astype(float), 0.0, 1.0)
             rs = X.sum(axis=1, keepdims=True)
             rs[rs <= 0.0] = 1.0
             Xn = X / rs
             for j, key in enumerate(created_keys):
                 sample.protein.row_attrs[key] = Xn[:, j].astype(float)
-
-def add_best_localised_tracks(
-    adata: AnnData,
-    *,
-    atlases: Sequence[str],
-    q: float = 0.90,
-    k: int = 15,
-    p: int = 2,
-) -> None:
-    """Create BestBroad.*, BestSimplified.*, BestDetailed.* score columns."""
-    if "X_umap" not in adata.obsm or adata.obsm["X_umap"].shape[1] != 2:
-        sc.pp.neighbors(adata, n_neighbors=30, use_rep="X_pca")
-        sc.tl.umap(adata, n_components=2, min_dist=0.3)
-
-    depth_to_labels = {
-        "Broad":      ["Immature", "Mature"],
-        "Simplified": list(SIMPLIFIED_CLASSES.keys()),
-        "Detailed":   _DETAILED_LABELS,
-    }
-
-    for depth, labels in depth_to_labels.items():
-        for lbl in labels:
-            atl, vec = _best_localised_score(adata, depth, lbl, atlases, q=q, k=k, p=p)
-            if vec is None:
-                continue
-            adata.obs[f"Best{depth}.{lbl}.predscore"] = vec
-            adata.obs[f"Best{depth}.{lbl}.atlas"] = atl

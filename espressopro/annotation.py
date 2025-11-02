@@ -50,6 +50,7 @@ from .constants import (
 # near the other imports in annotation.py
 from .prediction import EXCLUDE_ATLAS
 
+
 def _filter_atlases_for_label_local(atlases, depth, label, *, apply_exclusions: bool = True):
     if not apply_exclusions:
         return list(atlases)
@@ -667,9 +668,9 @@ def add_Averaged_tracks(
     out_prefix: str = "Averaged.",
     write_atlas_name: bool = True,
     atlas_name_value: str = "avg",
-    apply_exclusions: bool = True,   # NEW
+    apply_exclusions: bool = True,
 ) -> None:
-    """Average per-atlas predscores into Averaged.* tracks (now respecting EXCLUDE_ATLAS)."""
+    """Average per-atlas predscores into Averaged.* tracks (now respecting EXCLUDE_ATLAS + per-class reweighting)."""
     is_anndata = isinstance(obj, AnnData)
     is_sample = _is_mosaic_sample(obj)
     if not (is_anndata or is_sample):
@@ -678,6 +679,7 @@ def add_Averaged_tracks(
     if is_anndata:
         pending: dict[str, np.ndarray] = {}
         index = obj.obs.index
+
         def has_key(k: str) -> bool: return (k in obj.obs.columns) or (k in pending)
         def get_vec(k: str) -> np.ndarray: return pending.get(k, obj.obs[k].to_numpy())
         def set_vec(k: str, v: np.ndarray): pending[k] = np.asarray(v).ravel()
@@ -690,6 +692,7 @@ def add_Averaged_tracks(
         if not isinstance(df_scaled, pd.DataFrame):
             df_scaled = pd.DataFrame(df_scaled)
         index = df_scaled.index.astype(str)
+
         def has_key(k: str) -> bool: return k in obj.protein.row_attrs
         def get_vec(k: str) -> np.ndarray: return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
         def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v).ravel()
@@ -708,18 +711,21 @@ def add_Averaged_tracks(
         if atlas in atlases and level in levels:
             by_level_class.setdefault((level, klass), {})[atlas] = c
 
+    # normalise weights map to a dict[str,float] containing ATLAS-level priors
     if weights is None:
         weights = {}
     else:
-        weights = {k: float(v) for k, v in weights.items() if k in atlases}
+        weights = {str(k): float(v) for k, v in weights.items() if k in atlases}
 
     for (level, klass), atlas_cols in by_level_class.items():
-        # apply exclusions here
+        # 1) apply per-label exclusions
         allowed = _filter_atlases_for_label_local(atlases, level, klass, apply_exclusions=apply_exclusions)
+        # 2) keep only present columns among allowed atlases
         present = [a for a in allowed if a in atlas_cols]
         if not present:
             continue
 
+        # 3) stack remaining columns
         mats = []
         for a in present:
             key = atlas_cols[a]
@@ -730,20 +736,24 @@ def add_Averaged_tracks(
                 print(f"[add_Averaged_tracks] Skipping {key}: length {v.shape[0]} != {n}")
                 continue
             mats.append(v.reshape(1, -1))
-
         if not mats:
             continue
-        M = np.vstack(mats)
+        M = np.vstack(mats)  # shape: (#present, N)
 
+        # 4) weights over remaining atlases ONLY, renormalised to 1
         if weights:
-            w = np.array([weights.get(a, 0.0) for a in present], dtype=float)
-            if w.sum() <= 0:
+            w = np.array([max(0.0, float(weights.get(a, 0.0))) for a in present], dtype=float)
+            if not np.isfinite(w).all():
+                w = np.nan_to_num(w, nan=0.0, neginf=0.0, posinf=0.0)
+            if w.sum() <= 0.0:
+                # fallback to equal weights if all zero after exclusions
                 w = np.ones(len(present), dtype=float)
         else:
             w = np.ones(len(present), dtype=float)
         w = w / w.sum()
 
-        avg = (w[:, None] * M).sum(axis=0)
+        # 5) weighted mean across remaining
+        avg = (w[:, None] * M).sum(axis=0)  # (N,)
 
         out_col = f"{out_prefix}{level}.{klass}.predscore"
         set_vec(out_col, avg)
@@ -752,6 +762,7 @@ def add_Averaged_tracks(
             atlas_col = f"{out_prefix}{level}.{klass}.atlas"
             set_vec(atlas_col, np.array([atlas_name_value] * n, dtype=object))
 
+    # write Averaged.<level>.pred/conf from newly created predscores
     for level in levels:
         patt = re.compile(rf"^{re.escape(out_prefix)}{level}\.(.+)\.predscore$")
         class_names: List[str] = []
@@ -767,7 +778,7 @@ def add_Averaged_tracks(
             if not m:
                 continue
             klass = m.group(1)
-            v = get_vec(k)
+            v = pending.get(k, (obj.obs[k].to_numpy() if is_anndata else np.asarray(obj.protein.row_attrs[k])))
             if v.shape[0] != n:
                 continue
             class_names.append(klass)
@@ -784,7 +795,7 @@ def add_Averaged_tracks(
         set_vec(f"{out_prefix}{level}.pred", pred)
         set_vec(f"{out_prefix}{level}.conf", conf)
 
-    if is_anndata and pending:
+    if is_anndata and 'pending' in locals() and pending:
         _join_obs_cols(obj, pending)
 
 
@@ -881,6 +892,7 @@ def annotate_data(
     data_path: Optional[Union[str, Path]] = None,
     *,
     atlases: Sequence[str] = ("Hao", "Zhang", "Triana", "Luecken"),
+    weights: Optional[Mapping[str, float]] = None,  # <— pass-through for averaged weighting
 ):
     """
     Ensure predictions exist and normalized naming is used, then compute:
@@ -922,8 +934,12 @@ def annotate_data(
     now_keys = list(obj.obs.columns) if isinstance(obj, AnnData) else list(obj.protein.row_attrs.keys())
     if not any(_AVG_SCORE_RE.match(str(k)) for k in now_keys):
         print("[annotate_data] Averaged.* predscores missing; creating via add_Averaged_tracks...")
-        add_Averaged_tracks(obj, atlases=atlases, apply_exclusions=True)  # pass flag
-
+        add_Averaged_tracks(
+            obj,
+            atlases=atlases,
+            weights=weights,          # <— reweight across remaining atlases only
+            apply_exclusions=True,    # keep exclusions ON
+        )
 
     _ensure_averaged_level_preds(obj, levels=("Broad", "Simplified", "Detailed"))
 
@@ -967,7 +983,7 @@ def _get_matrix_for_embedding(
         n_comp = min(n_pca, X.shape[1]) if X.shape[1] > 1 else 1
         return X.reshape(-1, 1) if n_comp <= 1 else PCA(n_components=n_comp, random_state=0).fit_transform(X)
     else:
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
+        raise TypeError("Expected AnnData or missionbio.mosaic.sample")
 
 
 def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
@@ -1007,7 +1023,7 @@ def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
         for k in drop_attrs:
             del obj.protein.row_attrs[k]
     else:
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
+        raise TypeError("Expected AnnData or missionbio.mosaic.sample")
 
     return obj
 
@@ -1025,7 +1041,7 @@ def mark_mixed_clusters(
     is_sample  = _is_mosaic_sample(obj)
 
     if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
+        raise TypeError("Expected AnnData or missionbio.mosaic sample")
 
     if is_anndata:
         if cluster_col is None:
@@ -1100,7 +1116,7 @@ def refine_labels_by_knn_consensus(
     is_anndata = isinstance(obj, AnnData)
     is_sample  = _is_mosaic_sample(obj)
     if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
+        raise TypeError("Expected AnnData or missionbio.mosaic.Sample")
 
     out_col = out_col or f"{label_col}_refined_consensus"
 
@@ -1334,7 +1350,7 @@ def mark_small_clusters(
     is_sample = _is_mosaic_sample(obj)
 
     if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample.Sample")
+        raise TypeError("Expected AnnData or missionbio.mosaic.Sample")
 
     if is_anndata:
         if label_col not in obj.obs.columns:
@@ -1365,3 +1381,9 @@ def mark_small_clusters(
 
     obj.protein.row_attrs[label_col] = np.asarray(updated.values, dtype=object)
     return obj
+
+
+# Utility used above to merge 'pending' obs columns into adata.obs
+def _join_obs_cols(adata: AnnData, pending: Mapping[str, np.ndarray]) -> None:
+    for k, v in pending.items():
+        adata.obs[k] = v

@@ -81,7 +81,6 @@ DETAILED_PARENT_MAP = {
         "Averaged.Detailed.CD8_T_Memory.predscore",
         "Averaged.Detailed.MAIT.predscore",
     ],
-    "Plasma": ["Averaged.Detailed.Plasma.predscore"],
     "B": [
         "Averaged.Detailed.Plasma.predscore",
         "Averaged.Detailed.B_Naive.predscore",
