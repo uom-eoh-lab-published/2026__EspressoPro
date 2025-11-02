@@ -24,7 +24,7 @@ MODELS_SUBPATH = Path("Pre_trained_models") / ATLAS_NAME
 def download_models(
     *,
     force: bool = False,
-    url: str = "https://prod-dcd-datasets-public-files-eu-west-1.s3.eu-west-1.amazonaws.com/7f5b44ae-7fc4-4def-9b8b-be467f5be292",
+    url: str = "https://huggingface.co/EspressoKris/EspressoPro/resolve/main/models.tar.xz",
     local_archive: Optional[str] = None,
 ) -> Path:
     """
@@ -33,7 +33,7 @@ def download_models(
 
     Notes
     -----
-    - Downloads from a direct HTTPS link (S3); no Google Drive dependency.
+    - Downloads from a direct HTTPS link (Hugging Face); no Google Drive dependency.
     - Supports .tar, .tar.gz, .tar.xz, and .zip archives.
     - Safe extraction (prevents path traversal).
     """
