@@ -804,6 +804,7 @@ EXCLUDE_ATLAS: Dict[str, Dict[str, set]] = {
         "CD4_T_Memory":   {"Hao"},
         "CD4_T_Naive":   {"Hao"},
         "CD8_T_Naive":   {"Luecken"},
+        "Myeloid_progenitor":   {"Zhang", "Luecken"},
         "Immature_B":   {"Triana", "Hao", "Zhang"},
         "B_Naive":   {"Zhang", "Luecken"},
         "B_Memory":   {"Zhang", "Triana", "Luecken"},
