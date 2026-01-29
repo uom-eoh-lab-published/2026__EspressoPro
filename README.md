@@ -4,36 +4,20 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 
-**EspressoPro** is a modular toolkit for automated cell-type annotation of single-cell protein data. It ships pre-trained models, atlas consensus blending, and hierarchy-aware voting—plus optional MissionBio integration.
-
-## Features
-
-- **Hierarchical labels:** Broad → Simplified → Detailed  
-- **Pre-trained models:** Stacked ensembles for multiple atlases (Hao, Zhang, Triana, Luecken)  
-- **Atlas consensus:** Weighted blending by atlas consensus predictions, excluding erroneous predictors
-- **Signatures:** Built-ins (e.g., Mast) and custom marker signatures  
-- **Utilities:** Mixedness scoring, label refinement, quick visual checks  
-- **One-liner UX:** Sensible defaults; models auto-download on first run
+**EspressoPro** is an automated, ontology-guided cell type annotator for single-cell surface protein (ADT) data, designed for Mission Bio Tapestri DNA+ADT assays and similar protein-only platforms. It uses pre-trained, per–cell type stacked models from four label-harmonised CITE-seq reference atlases of healthy blood and bone marrow cells. Predictions are combined across references and constrained by a cellular ontology to produce consistent immune and progenitor cell annotations, including rare populations.
 
 ## Install
 
 **Latest (GitHub):**
 ```bash
-pip install git+https://github.com/uom-eoh-lab-published/2024__EspressoPro.git
+pip install git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git
 ```
 
-**Dev mode:**
-```bash
-git clone https://github.com/uom-eoh-lab-published/2024__EspressoPro.git
-cd EspressoPro
-pip install -e ".[dev]"
-```
-
-**MissionBio (optional, via conda):**
+**Stable MissionBio Environment:**
 ```bash
 conda create -n mosaic -c missionbio -c conda-forge   python=3.10 missionbio.mosaic-base=3.12.2 python-kaleido -y
 conda activate mosaic
-pip install git+https://github.com/uom-eoh-lab-published/2024__EspressoPro.git
+pip install git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git
 ```
 
 ## Quick start
@@ -45,8 +29,8 @@ import espressopro as ep
 
 # Load and preprocess data
 sample = ms.load("sample.h5")  
-ep.Normalise_protein_data(sample)  
-ep.Scale_protein_data(sample)  
+ep.Normalise_protein_data(sample, inplace=True, axis=1, flavor="seurat")
+ep.Scale_protein_data(sample, inplace=True)
 
 # Dimensionality reduction and clustering
 sample.protein.run_pca(
@@ -63,41 +47,38 @@ sample.protein.cluster(
 sample = ep.generate_predictions(obj=sample)  
 sample = ep.annotate_data(obj=sample)  
 
-# Quality control and refinement
-sample = ep.mark_small_clusters(sample, "Simplified.Celltype", min_cells=3)
-sample = ep.mark_small_clusters(sample, "Detailed.Celltype", min_cells=3)
-sample = ep.mark_mixed_clusters(sample, "Simplified.Celltype")
-sample = ep.mark_mixed_clusters(sample, "Detailed.Celltype")
-sample = ep.refine_labels_by_knn_consensus(sample, label_col='Detailed.Celltype')
-
 # Optional: add marker-based calls
-sample = ep.add_mast_annotation(sample)
+sample = ep.add_mast_annotation(sample, )
 
 # Optional: expand cell type labels to clusters
-sample = ep.suggest_cluster_celltype_identity(
+sample, summary, pivot = ep.suggest_cluster_celltype_identity(
     sample=sample,
-    annotation="Detailed.Celltype_refined_consensus", rewrite=True)
+    dominance_threshold=0.35,
+    annotation_col="Averaged.Detailed.Celltype",
+    cluster_col="Clusters",
+    rewrite=True,
+    verbose=True
+)
 ```
 
-**Full tutorial:** [MissionBio_Tapestri.ipynb](https://github.com/uom-eoh-lab-published/2024__EspressoPro/blob/main/tutorials/MissionBio_Tapestri.ipynb)
+**Full tutorial:** [MissionBio_Tapestri.ipynb](https://github.com/uom-eoh-lab-published/2026__EspressoPro/blob/main/tutorials/MissionBio_Tapestri.ipynb)
 
-## Requirements (core)
+## Repositories  
 
-Python ≥3.8; key libs: `numpy`, `pandas`, `scipy`, `scikit-learn`, `scanpy`, `anndata`, `gdown`.  
-MissionBio features require `missionbio.mosaic` (conda).
+- Model: <https://huggingface.co/EspressoKris/EspressoPro>  
 
 ## Documentation
 
 - Docs: <https://espressopro.readthedocs.io>  
-- Repo: <https://github.com/uom-eoh-lab-published/2024__EspressoPro>
+- Manuscript: <https://github.com/uom-eoh-lab-published/2026__EspressoPro_Manuscript>
 
 ## Citation
 ```bibtex
 @software{espressopro,
-  title   = {EspressoPro: Modular cell type annotation pipeline for PB/BM-MNCs single-cell protein data},
+  title   = {EspressoPro: An Automated Machine Learning Driven Protein Annotator For Tapestri Data},
   author  = {Gurashi, Kristian},
-  year    = {2025},
-  url     = {https://github.com/uom-eoh-lab-published/2024__EspressoPro},
+  year    = {2026},
+  url     = {https://github.com/uom-eoh-lab-published/2026__EspressoPro},
   version = {1.0.0}
 }
 ```

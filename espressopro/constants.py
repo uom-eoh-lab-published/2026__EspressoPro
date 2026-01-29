@@ -13,8 +13,8 @@ _DETAILED_LABELS = [
     "HSC_MPP", "MEP", "ErP", "GMP", "Pre-Pro-B", "EoBaMaP", "Plasma",
     "B_Naive", "B_Memory", "Immature_B", "CD4_T_Naive", "CD4_T_Memory", "CD4_CTL",
     "Treg", "CD8_T_Naive", "CD8_T_Memory", "MAIT", "NK_CD56_dim", "NK_CD56_bright",
-    "Erythroblast", "Stroma", "pDC", "gdT", "Myeloid_progenitor",
-    "Pre-B", "Pro-B",
+    "Erythroblast", "Stroma", "pDC", "GdT", "Myeloid_progenitor",
+    "Pre-B", "Pro-B" "LMPP"
 ]
 
 # Simplified class → sources to vote over
@@ -44,11 +44,13 @@ DETAILED_PARENT_MAP = {
         "Averaged.Detailed.HSC_MPP.predscore",
         "Averaged.Detailed.GMP.predscore",
         "Averaged.Detailed.Pre-Pro-B.predscore",
+        "Averaged.Detailed.MkP.predscore",
+        "Averaged.Detailed.LMPP.predscore",
+        "Averaged.Detailed.EoBaMaP.predscore",
         "Averaged.Detailed.MEP.predscore",
         "Averaged.Detailed.Pro-B.predscore",
     ],
     "Erythroid": [
-        "Averaged.Detailed.HSC_MPP.predscore",
         "Averaged.Detailed.MEP.predscore",
         "Averaged.Detailed.ErP.predscore",
         "Averaged.Detailed.Erythroblast.predscore",
@@ -57,6 +59,8 @@ DETAILED_PARENT_MAP = {
     "Monocyte": [
         "Averaged.Detailed.CD14_Mono.predscore",
         "Averaged.Detailed.CD16_Mono.predscore",
+        "Averaged.Detailed.cDC1.predscore",
+        "Averaged.Detailed.cDC2.predscore",
     ],
     "Myeloid": ["Averaged.Detailed.Myeloid_progenitor.predscore"],
     "cDC": [
@@ -64,7 +68,8 @@ DETAILED_PARENT_MAP = {
         "Averaged.Detailed.cDC2.predscore",
     ],
     "Other_T": [
-        "Averaged.Detailed.gdT.predscore",
+        "Averaged.Detailed.GdT.predscore",
+        "Averaged.Detailed.MAIT.predscore",
     ],
     "NK": [
         "Averaged.Detailed.NK_CD56_dim.predscore",
@@ -88,7 +93,9 @@ DETAILED_PARENT_MAP = {
         "Averaged.Detailed.Immature_B.predscore",
         "Averaged.Detailed.Pre-B.predscore",
         "Averaged.Detailed.Pro-B.predscore",
+        "Averaged.Detailed.Pre-Pro-B.predscore",
     ],
+    "Plasma": ["Averaged.Detailed.Plasma.predscore"],
 }
 
 # Mast cell signatures

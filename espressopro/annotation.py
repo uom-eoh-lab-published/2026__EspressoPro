@@ -1,57 +1,60 @@
 # -*- coding: utf-8 -*-
-"""Cell type annotation workflows and voting systems with Averaged + per-atlas outputs.
+"""
+Cell type annotation workflows (Averaged + per-atlas outputs) with hierarchy constraints.
 
 What this module produces
 -------------------------
 Averaged winners (pred/conf) and constrained labels:
-    Averaged.Broad.pred / conf
-    Averaged.Simplified.pred / conf
-    Averaged.Detailed.pred / conf
     Averaged.Broad.Celltype (+ TopScore/LowConf)
     Averaged.Simplified.Celltype (+ TopScore/LowConf)
     Averaged.Detailed.Celltype (+ TopScore/LowConf)
 
-Per-atlas (no 'Atlas.' prefix) hierarchy-constrained labels:
+Per-atlas hierarchy-constrained labels (no 'Atlas.' prefix):
     <Atlas>.Broad.Celltype (+ TopScore/LowConf)
     <Atlas>.Simplified.Celltype (+ TopScore/LowConf)
     <Atlas>.Detailed.Celltype (+ TopScore/LowConf)
 
+Constrained probability tracks:
+    Averaged.Simplified.<cls>.predscore.constrained
+    Averaged.Detailed.<cls>.predscore.constrained
+    <Atlas>.Simplified.<cls>.predscore.constrained
+    <Atlas>.Detailed.<cls>.predscore.constrained
+
 Housekeeping:
-    - Legacy 'Atlas.<name>.*' are converted to '<name>.*' (if needed) and then removed.
-    - 'Averaged.Unweighted.*' tracks are removed.
+    - Legacy 'Atlas.<name>.*' converted to '<name>.*' (if needed) and then removed.
+    - 'Averaged.Unweighted.*' tracks removed.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Tuple, Union, Optional, Any, Sequence, Mapping
-
-import copy
 import re
-import warnings
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import anndata as ad
 from anndata import AnnData
-from scipy.sparse import isspmatrix, issparse
-from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_samples
-from sklearn.neighbors import NearestNeighbors
 
-from .prediction import generate_predictions, add_best_localised_tracks
 from .constants import (
     SIMPLIFIED_CLASSES,
     DETAILED_CLASSES,
     SIMPLIFIED_PARENT_MAP,
     DETAILED_PARENT_MAP,
 )
-
-# near the other imports in annotation.py
 from .prediction import EXCLUDE_ATLAS
 
 
-def _filter_atlases_for_label_local(atlases, depth, label, *, apply_exclusions: bool = True):
+# -----------------------------------------------------------------------------
+# Core helpers
+# -----------------------------------------------------------------------------
+
+def _filter_atlases_for_label_local(
+    atlases: Sequence[str],
+    depth: str,
+    label: str,
+    *,
+    apply_exclusions: bool = True,
+) -> List[str]:
     if not apply_exclusions:
         return list(atlases)
     banned = EXCLUDE_ATLAS.get(depth, {}).get(label, set())
@@ -63,151 +66,12 @@ def _is_mosaic_sample(x: Any) -> bool:
 
 
 def _class_from_key(k: str) -> str:
+    # expects something like: "<prefix>.<Class>.predscore"  -> returns "<Class>"
     parts = str(k).split(".")
     return parts[-2] if len(parts) >= 3 and parts[-1] == "predscore" else ""
 
 
-def _clr_fallback(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    X = np.asarray(X, dtype=float)
-    X[~np.isfinite(X)] = 0.0
-    logs = np.log(X + eps)
-    return logs - logs.mean(axis=1, keepdims=True)
-
-
-def Normalise_protein_data(
-    data,
-    inplace: bool = True,
-    jitter: float = 0.45,
-    random_state: int = 42,
-    scale: Optional[float] = None,
-):
-    """NSP normalization for protein counts with CLR fallback."""
-    is_mosaic_sample = hasattr(data, "protein") and hasattr(getattr(data, "protein"), "layers")
-    if is_mosaic_sample and "read_counts" in data.protein.layers:
-        counts = data.protein.layers["read_counts"]
-        X = counts.toarray() if isspmatrix(counts) or issparse(counts) else np.asarray(counts, dtype=float)
-        try:
-            from missionbio.demultiplex.protein.nsp import NSP
-            nsp = NSP(jitter=jitter, random_state=random_state)
-            Xn = nsp.transform(X, scale=scale)
-            print("[Normalise_protein_data] Applied MissionBio NSP normalization")
-        except ImportError:
-            warnings.warn("MissionBio package not available. Falling back to CLR normalization.")
-            Xn = _clr_fallback(X)
-            print("[Normalise_protein_data] Applied CLR normalization (fallback)")
-        except Exception as e:
-            warnings.warn(f"NSP normalization failed ({e}). Falling back to CLR normalization.")
-            Xn = _clr_fallback(X)
-            print("[Normalise_protein_data] Applied CLR normalization (fallback)")
-
-        if inplace:
-            data.protein.layers["Normalized_reads"] = Xn
-            return None
-        sample_copy = data.copy() if hasattr(data, "copy") else copy.deepcopy(data)
-        sample_copy.protein.layers["Normalized_reads"] = Xn
-        return sample_copy
-
-    is_anndata = isinstance(data, AnnData)
-
-    if is_anndata:
-        adata = data if inplace else data.copy()
-        X = adata.X.toarray() if issparse(adata.X) or isspmatrix(adata.X) else np.asarray(adata.X, dtype=float)
-        try:
-            from missionbio.demultiplex.protein.nsp import NSP
-            nsp = NSP(jitter=jitter, random_state=random_state)
-            Xn = nsp.transform(X, scale=scale)
-            print("[Normalise_protein_data] Applied MissionBio NSP normalization")
-        except ImportError:
-            warnings.warn("MissionBio package not available. Falling back to CLR normalization.")
-            Xn = _clr_fallback(X)
-            print("[Normalise_protein_data] Applied CLR normalization (fallback)")
-        except Exception as e:
-            warnings.warn(f"NSP normalization failed ({e}). Falling back to CLR normalization.")
-            Xn = _clr_fallback(X)
-            print("[Normalise_protein_data] Applied CLR normalization (fallback)")
-
-        adata.X = Xn
-        return None if inplace else adata
-
-    if isinstance(data, pd.DataFrame):
-        X = data.values.astype(float)
-        return _nsp_then_clr(X, jitter, random_state, scale)
-
-    if isinstance(data, np.ndarray) or issparse(data) or isspmatrix(data):
-        X = data.toarray() if issparse(data) or isspmatrix(data) else np.asarray(data, dtype=float)
-        return _nsp_then_clr(X, jitter, random_state, scale)
-
-    raise ValueError(
-        "Input must be a MissionBio Sample (protein.layers['read_counts']), AnnData, numpy array, DataFrame, or sparse."
-    )
-
-
-def _nsp_then_clr(X: np.ndarray, jitter: float, random_state: int, scale: Optional[float]) -> np.ndarray:
-    try:
-        from missionbio.demultiplex.protein.nsp import NSP
-        nsp = NSP(jitter=jitter, random_state=random_state)
-        Xn = nsp.transform(X, scale=scale)
-        print("[Normalise_protein_data] Applied MissionBio NSP normalization")
-        return Xn
-    except ImportError:
-        warnings.warn("MissionBio package not available. Falling back to CLR normalization.")
-    except Exception as e:
-        warnings.warn(f"NSP normalization failed ({e}). Falling back to CLR normalization.")
-    Xn = _clr_fallback(X)
-    print("[Normalise_protein_data] Applied CLR normalization (fallback)")
-    return Xn
-
-
-def Scale_protein_data(data, inplace: bool = True):
-    """StandardScaler on normalized protein data."""
-    try:
-        from missionbio.mosaic.sample import Sample
-    except ImportError:
-        Sample = None
-
-    if Sample is not None and isinstance(data, Sample):
-        if "Normalized_reads" not in data.protein.layers:
-            raise ValueError("No 'Normalized_reads' layer found in Sample.protein.layers")
-        x_array = np.array(data.protein.layers["Normalized_reads"], dtype=np.float64)
-        from sklearn import preprocessing
-        scaler = preprocessing.StandardScaler()
-        data.protein.layers["Scaled_reads"] = scaler.fit_transform(x_array)
-        print("[Scale_protein_data] Scaled 'Normalized_reads' -> saved as 'Scaled_reads'")
-        return None
-
-    if isinstance(data, AnnData):
-        adata = data if inplace else data.copy()
-        x = adata.X
-    else:
-        if isinstance(data, (pd.DataFrame, np.ndarray)) or issparse(data) or isspmatrix(data):
-            x = data
-        else:
-            raise ValueError("Input must be AnnData, MissionBio Sample, numpy array, DataFrame, or sparse matrix")
-
-    if isinstance(x, pd.DataFrame):
-        x_array = x.values.astype(np.float64)
-        is_dataframe = True
-        df_index, df_columns = x.index, x.columns
-    elif issparse(x) or isspmatrix(x):
-        x_array = x.toarray().astype(np.float64)
-        is_dataframe = False
-    else:
-        x_array = np.array(x, dtype=np.float64)
-        is_dataframe = False
-
-    from sklearn import preprocessing
-    scaler = preprocessing.StandardScaler()
-    scaled = scaler.fit_transform(x_array)
-
-    if isinstance(data, AnnData):
-        data.X = scaled
-        return None if inplace else data
-    if is_dataframe:
-        return pd.DataFrame(scaled, index=df_index, columns=df_columns)
-    return scaled
-
-
-def _make_meta_from_row_attrs(sample, needed_cols):
+def _make_meta_from_row_attrs(sample: Any, needed_cols: Sequence[str]) -> AnnData:
     df_scaled = sample.protein.get_attribute("Scaled_reads", constraint="row+col")
     if not isinstance(df_scaled, pd.DataFrame):
         df_scaled = pd.DataFrame(df_scaled)
@@ -222,12 +86,16 @@ def _make_meta_from_row_attrs(sample, needed_cols):
     return ad.AnnData(X=np.zeros((len(idx), 0), dtype=float), obs=obs, var=pd.DataFrame(index=[]))
 
 
-def _write_obs_to_row_attrs(sample, adata_meta, cols):
+def _write_obs_to_row_attrs(sample: Any, adata_meta: AnnData, cols: Sequence[str]) -> None:
     for c in cols:
         if c not in adata_meta.obs.columns:
             continue
         vals = adata_meta.obs[c]
-        arr = vals.astype(str).to_numpy() if pd.api.types.is_categorical_dtype(vals) else np.asarray(vals.to_numpy())
+        arr = (
+            vals.astype(str).to_numpy()
+            if pd.api.types.is_categorical_dtype(vals)
+            else np.asarray(vals.to_numpy())
+        )
         sample.protein.row_attrs[c] = arr
 
 
@@ -243,8 +111,12 @@ def _runtime_parent_subset(parent_map: Dict[str, List[str]], cols_available: set
     return {p: [c for c in cols if c in cols_available] for p, cols in parent_map.items()}
 
 
+# -----------------------------------------------------------------------------
+# Voting annotator (core engine)
+# -----------------------------------------------------------------------------
+
 def voting_annotator(
-    obj: Union["AnnData", object],
+    obj: Union[AnnData, Any],
     level_name: str,
     class_to_sources: Dict[str, List[str]],
     parent_field: Optional[str] = None,
@@ -253,7 +125,23 @@ def voting_annotator(
     *,
     normalize: bool = False,
 ) -> None:
-    """Aggregate sources → per-class predscores, optional masking, and final labels."""
+    """
+    Aggregate sources → per-class predscores, optional hierarchy masking, optional renormalization,
+    and final labels.
+
+    Writes:
+        <level_name>.<Class>.predscore (one per Class)
+        <level_name>.Celltype
+        <level_name>.Celltype.TopScore
+        <level_name>.Celltype.LowConf
+
+    Important behavior:
+        - If `normalize=True`, this performs *probability renormalization* (divide by row-sum of
+          allowed classes), NOT a softmax. This prevents "forced 1/0" collapse when the allowed
+          set effectively has only one available sibling (common when some classes are missing).
+        - Additionally, if a row has <2 allowed classes, we do NOT renormalize it (we keep the
+          masked probabilities as-is) to avoid turning any nonzero into 1.0.
+    """
     is_anndata = isinstance(obj, AnnData)
     is_sample = _is_mosaic_sample(obj)
     if not (is_anndata or is_sample):
@@ -262,21 +150,41 @@ def voting_annotator(
     if is_anndata:
         n = obj.n_obs
 
-        def has_key(k: str) -> bool: return k in obj.obs.columns
-        def get_vec(k: str) -> np.ndarray: return obj.obs[k].to_numpy()
-        def set_vec(k: str, v: np.ndarray): obj.obs[k] = v
-        def list_keys() -> List[str]: return list(obj.obs.columns)
+        def has_key(k: str) -> bool:
+            return k in obj.obs.columns
+
+        def get_vec(k: str) -> np.ndarray:
+            return obj.obs[k].to_numpy()
+
+        def set_vec(k: str, v: np.ndarray) -> None:
+            obj.obs[k] = v
+
+        def list_keys() -> List[str]:
+            return list(obj.obs.columns)
+
     else:
         df_scaled = obj.protein.get_attribute("Scaled_reads", constraint="row+col")
         if not isinstance(df_scaled, pd.DataFrame):
             df_scaled = pd.DataFrame(df_scaled)
         n = len(df_scaled.index)
 
-        def has_key(k: str) -> bool: return k in obj.protein.row_attrs
-        def get_vec(k: str) -> np.ndarray: return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
-        def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v)
-        def list_keys() -> List[str]: return list(obj.protein.row_attrs.keys())
+        def has_key(k: str) -> bool:
+            return k in obj.protein.row_attrs
 
+        def get_vec(k: str) -> np.ndarray:
+            return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
+
+        def set_vec(k: str, v: np.ndarray) -> None:
+            obj.protein.row_attrs[k] = np.asarray(v)
+
+        def list_keys() -> List[str]:
+            return list(obj.protein.row_attrs.keys())
+
+    # -------------------------------------------------------------------------
+    # Build <level_name>.<Class>.predscore columns by averaging/copying sources
+    # -------------------------------------------------------------------------
+
+    # Fast path: every class has exactly one present source column
     all_single = True
     for _, cols in class_to_sources.items():
         present = [c for c in cols if has_key(c)]
@@ -287,68 +195,100 @@ def voting_annotator(
     if all_single:
         for out_cls, cols in class_to_sources.items():
             src = [c for c in cols if has_key(c)][0]
-            set_vec(f"{level_name}.{out_cls}.predscore", get_vec(src))
+            v = get_vec(src)
+            if v.shape[0] != n:
+                raise ValueError(f"Source column '{src}' length {v.shape[0]} != n_obs {n}")
+            set_vec(f"{level_name}.{out_cls}.predscore", v)
     else:
         for out_cls, cols in class_to_sources.items():
             present = [c for c in cols if has_key(c)]
-            if present:
-                mats = [get_vec(c) for c in present]
-                mats = [m.reshape(-1) for m in mats if m.shape[0] == n]
-                if mats:
-                    avg = np.mean(np.vstack(mats), axis=0)
-                    set_vec(f"{level_name}.{out_cls}.predscore", avg)
+            if not present:
+                continue
+            mats = []
+            for c in present:
+                v = get_vec(c).reshape(-1)
+                if v.shape[0] != n:
+                    continue
+                mats.append(v)
+            if mats:
+                avg = np.mean(np.vstack(mats), axis=0)
+                set_vec(f"{level_name}.{out_cls}.predscore", avg)
 
-    score_cols = [k for k in list_keys() if k.startswith(f"{level_name}.") and k.endswith(".predscore")]
+    # Collect score columns for this level
+    score_cols = [k for k in list_keys() if str(k).startswith(f"{level_name}.") and str(k).endswith(".predscore")]
     if not score_cols:
         return
 
+    # Matrix of scores (N, C)
     rows = []
     for k in score_cols:
-        v = get_vec(k)
-        vv = v if v.shape[0] == n else np.zeros(n, dtype=float)
-        rows.append(vv.reshape(1, -1))
-    M = np.vstack(rows).T
+        v = get_vec(k).reshape(-1)
+        if v.shape[0] != n:
+            v = np.zeros(n, dtype=float)
+        rows.append(v.reshape(1, -1))
+    M = np.vstack(rows).T  # (N, C)
 
+    # -------------------------------------------------------------------------
+    # Optional hierarchy mask
+    # parent_to_subset values can be:
+    #   - full predscore column names, e.g. "Averaged.Detailed.X.predscore"
+    #   - OR bare class names, e.g. "X"
+    # -------------------------------------------------------------------------
     mask = np.ones_like(M, dtype=bool)
-    if parent_field and parent_to_subset and (parent_field in list_keys()):
+
+    if parent_field and parent_to_subset and (parent_field in set(list_keys())):
         parents = get_vec(parent_field).astype(str)
 
-        def _classes_from_fullcols(cols_list):
+        def _to_class_set(items: List[str]) -> set:
             out = set()
-            for s in cols_list:
-                parts = str(s).split(".")
-                if len(parts) >= 3 and parts[-1] == "predscore":
-                    out.add(parts[-2])
+            for s in items:
+                s = str(s)
+                # full column name
+                if s.endswith(".predscore"):
+                    out.add(_class_from_key(s))
+                else:
+                    # bare class name
+                    out.add(s)
+            out.discard("")
             return out
 
-        allowed_classes = {p: _classes_from_fullcols(cols) for p, cols in parent_to_subset.items()}
+        allowed_classes = {p: _to_class_set(cols) for p, cols in parent_to_subset.items()}
         out_class_names = [_class_from_key(c) for c in score_cols]
 
         for i in range(n):
             p = parents[i]
-            if p in allowed_classes:
-                keep = allowed_classes[p]
-                if len(keep) == 0:
-                    mask[i, :] = False
-                else:
-                    for j, cls in enumerate(out_class_names):
-                        mask[i, j] = (cls in keep)
+            if p not in allowed_classes:
+                continue
+            keep = allowed_classes[p]
+            # If keep is empty, do not constrain this row (leave mask all True).
+            if not keep:
+                continue
+            for j, cls in enumerate(out_class_names):
+                mask[i, j] = (cls in keep)
 
+    # Apply mask (disallowed -> 0), and clip
+    P = np.where(mask, M, 0.0)
+    P = np.clip(P, 0.0, 1.0)
+
+    # -------------------------------------------------------------------------
+    # Renormalize among allowed classes (probability renormalization, not softmax)
+    # Key bugfix:
+    #   - If only one class is allowed for a row, do NOT renormalize to 1.0.
+    #     Keep the original masked probability magnitude.
+    # -------------------------------------------------------------------------
     if normalize:
-        M_masked = np.where(mask, M, -np.inf)
-        Mmax = np.max(M_masked, axis=1, keepdims=True)
-        M_stable = M_masked - Mmax
-        Z = np.exp(M_stable)
-        denom = Z.sum(axis=1, keepdims=True)
-        denom[denom == 0.0] = 1.0
-        P = Z / denom
-    else:
-        P = np.where(mask, M, 0.0)
-        P = np.clip(P, 0.0, 1.0)
+        allowed_ct = mask.sum(axis=1)
+        renorm_rows = allowed_ct >= 2
+        if np.any(renorm_rows):
+            denom = P[renorm_rows].sum(axis=1, keepdims=True)
+            denom[denom == 0.0] = 1.0
+            P[renorm_rows] = P[renorm_rows] / denom
 
+    # Write back predscores (now masked + optionally renormalized)
     for j, k in enumerate(score_cols):
         set_vec(k, P[:, j])
 
+    # Winner fields
     winner_idx = np.argmax(P, axis=1)
     winner_scores = P[np.arange(P.shape[0]), winner_idx]
     winner_cols = np.array(score_cols, dtype=object)[winner_idx]
@@ -356,14 +296,17 @@ def voting_annotator(
 
     set_vec(f"{level_name}.Celltype", winners)
     set_vec(f"{level_name}.Celltype.TopScore", winner_scores)
-    set_vec(f"{level_name}.Celltype.LowConf", (winner_scores < conf_threshold).astype(bool))
+    set_vec(f"{level_name}.Celltype.LowConf", (winner_scores < float(conf_threshold)).astype(bool))
 
+# -----------------------------------------------------------------------------
+# Averaged hierarchical annotation (Broad → Simplified → Detailed)
+# -----------------------------------------------------------------------------
 
-def Broad_Annotation(adata_or_sample, conf_threshold: float = 0.75):
+def Broad_Annotation(adata_or_sample: Union[AnnData, Any], conf_threshold: float = 0.75):
     """Broad (Mature/Immature) from Averaged.Broad.*."""
     level_name = "Averaged.Broad"
     REF = {
-        "Mature":   [f"{level_name}.Mature.predscore"],
+        "Mature": [f"{level_name}.Mature.predscore"],
         "Immature": [f"{level_name}.Immature.predscore"],
     }
 
@@ -376,8 +319,9 @@ def Broad_Annotation(adata_or_sample, conf_threshold: float = 0.75):
                 raise KeyError(f"[Broad] Missing required column in row_attrs: {k}")
         voting_annotator(meta, level_name, REF, conf_threshold=conf_threshold)
         _write_obs_to_row_attrs(
-            sample, meta,
-            [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"]
+            sample,
+            meta,
+            [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"],
         )
         return sample
 
@@ -389,34 +333,43 @@ def Broad_Annotation(adata_or_sample, conf_threshold: float = 0.75):
     return adata
 
 
-def Simplified_Annotation(adata_or_sample, conf_threshold: float = 0.75):
+def Simplified_Annotation(adata_or_sample: Union[AnnData, Any], conf_threshold: float = 0.75):
     """Constrained Simplified from Averaged.Simplified.* gated by Averaged.Broad.Celltype."""
     level_name = "Averaged.Simplified"
 
     if _is_mosaic_sample(adata_or_sample):
         sample = adata_or_sample
-        if f"Averaged.Broad.Celltype" not in sample.protein.row_attrs:
+        if "Averaged.Broad.Celltype" not in sample.protein.row_attrs:
             Broad_Annotation(sample, conf_threshold=conf_threshold)
 
         meta = _make_meta_from_row_attrs(sample, list(sample.protein.row_attrs.keys()))
-        if "Averaged.Broad.Celltype" in sample.protein.row_attrs:
-            meta.obs["Averaged.Broad.Celltype"] = np.asarray(sample.protein.row_attrs["Averaged.Broad.Celltype"])
+        meta.obs["Averaged.Broad.Celltype"] = np.asarray(sample.protein.row_attrs["Averaged.Broad.Celltype"])
 
         available = set(meta.obs.columns)
         rt_classes = _runtime_class_map(SIMPLIFIED_CLASSES, available)
         rt_parents = _runtime_parent_subset(SIMPLIFIED_PARENT_MAP, available)
 
         voting_annotator(
-            meta, level_name, rt_classes,
+            meta,
+            level_name,
+            rt_classes,
             parent_field="Averaged.Broad.Celltype",
             parent_to_subset=rt_parents,
             conf_threshold=conf_threshold,
+            normalize=True,
         )
 
+        # expose constrained predscores as *.predscore.constrained
+        for lbl in SIMPLIFIED_CLASSES.keys():
+            src = f"{level_name}.{lbl}.predscore"
+            if src in meta.obs.columns:
+                meta.obs[f"{level_name}.{lbl}.predscore.constrained"] = meta.obs[src].astype(float)
+
         _write_obs_to_row_attrs(
-            sample, meta,
-            [c for c in meta.obs.columns if c.startswith(f"{level_name}.") and c.endswith(".predscore")]
-            + [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"]
+            sample,
+            meta,
+            [c for c in meta.obs.columns if c.startswith(f"{level_name}.") and (c.endswith(".predscore") or c.endswith(".predscore.constrained"))]
+            + [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"],
         )
         return sample
 
@@ -429,42 +382,60 @@ def Simplified_Annotation(adata_or_sample, conf_threshold: float = 0.75):
     rt_parents = _runtime_parent_subset(SIMPLIFIED_PARENT_MAP, available)
 
     voting_annotator(
-        adata, level_name, rt_classes,
+        adata,
+        level_name,
+        rt_classes,
         parent_field="Averaged.Broad.Celltype",
         parent_to_subset=rt_parents,
         conf_threshold=conf_threshold,
+        normalize=True,
     )
+
+    for lbl in SIMPLIFIED_CLASSES.keys():
+        src = f"{level_name}.{lbl}.predscore"
+        if src in adata.obs.columns:
+            adata.obs[f"{level_name}.{lbl}.predscore.constrained"] = adata.obs[src].astype(float)
+
     return adata
 
 
-def Detailed_Annotation(adata_or_sample, conf_threshold: float = 0.6):
+def Detailed_Annotation(adata_or_sample: Union[AnnData, Any], conf_threshold: float = 0.6):
     """Constrained Detailed from Averaged.Detailed.* gated by Averaged.Simplified.Celltype."""
     level_name = "Averaged.Detailed"
 
     if _is_mosaic_sample(adata_or_sample):
         sample = adata_or_sample
-        if f"Averaged.Simplified.Celltype" not in sample.protein.row_attrs:
+        if "Averaged.Simplified.Celltype" not in sample.protein.row_attrs:
             Simplified_Annotation(sample, conf_threshold=0.75)
 
         meta = _make_meta_from_row_attrs(sample, list(sample.protein.row_attrs.keys()))
-        if "Averaged.Simplified.Celltype" in sample.protein.row_attrs:
-            meta.obs["Averaged.Simplified.Celltype"] = np.asarray(sample.protein.row_attrs["Averaged.Simplified.Celltype"])
+        meta.obs["Averaged.Simplified.Celltype"] = np.asarray(sample.protein.row_attrs["Averaged.Simplified.Celltype"])
 
         available = set(meta.obs.columns)
         rt_classes = _runtime_class_map(DETAILED_CLASSES, available)
         rt_parents = _runtime_parent_subset(DETAILED_PARENT_MAP, available)
 
         voting_annotator(
-            meta, level_name, rt_classes,
+            meta,
+            level_name,
+            rt_classes,
             parent_field="Averaged.Simplified.Celltype",
             parent_to_subset=rt_parents,
             conf_threshold=conf_threshold,
+            normalize=True,
         )
 
+        # expose constrained predscores as *.predscore.constrained
+        for lbl in DETAILED_CLASSES.keys():
+            src = f"{level_name}.{lbl}.predscore"
+            if src in meta.obs.columns:
+                meta.obs[f"{level_name}.{lbl}.predscore.constrained"] = meta.obs[src].astype(float)
+
         _write_obs_to_row_attrs(
-            sample, meta,
-            [c for c in meta.obs.columns if c.startswith(f"{level_name}.") and c.endswith(".predscore")]
-            + [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"]
+            sample,
+            meta,
+            [c for c in meta.obs.columns if c.startswith(f"{level_name}.") and (c.endswith(".predscore") or c.endswith(".predscore.constrained"))]
+            + [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"],
         )
         return sample
 
@@ -477,37 +448,51 @@ def Detailed_Annotation(adata_or_sample, conf_threshold: float = 0.6):
     rt_parents = _runtime_parent_subset(DETAILED_PARENT_MAP, available)
 
     voting_annotator(
-        adata, level_name, rt_classes,
+        adata,
+        level_name,
+        rt_classes,
         parent_field="Averaged.Simplified.Celltype",
         parent_to_subset=rt_parents,
         conf_threshold=conf_threshold,
+        normalize=True,
     )
+
+    for lbl in DETAILED_CLASSES.keys():
+        src = f"{level_name}.{lbl}.predscore"
+        if src in adata.obs.columns:
+            adata.obs[f"{level_name}.{lbl}.predscore.constrained"] = adata.obs[src].astype(float)
+
     return adata
 
 
+# -----------------------------------------------------------------------------
+# Atlas constrained annotation (Broad → Simplified → Detailed)
+# Produces per-atlas *.predscore.constrained tracks
+# -----------------------------------------------------------------------------
+
 _SIMPLIFIED_NAMES: List[str] = list(SIMPLIFIED_CLASSES.keys())
-_DETAILED_NAMES:   List[str] = list(DETAILED_CLASSES.keys())
+_DETAILED_NAMES: List[str] = list(DETAILED_CLASSES.keys())
 
 
-def _build_simplified_classmap_for(atlas: str) -> dict[str, list[str]]:
+def _build_simplified_classmap_for(atlas: str) -> Dict[str, List[str]]:
     return {lbl: [f"{atlas}.Simplified.{lbl}.predscore"] for lbl in _SIMPLIFIED_NAMES}
 
 
-def _build_detailed_classmap_for(atlas: str) -> dict[str, list[str]]:
+def _build_detailed_classmap_for(atlas: str) -> Dict[str, List[str]]:
     return {lbl: [f"{atlas}.Detailed.{lbl}.predscore"] for lbl in _DETAILED_NAMES}
 
 
-def _build_simplified_parentmap_for(atlas: str) -> dict[str, list[str]]:
+def _build_simplified_parentmap_for(atlas: str) -> Dict[str, List[str]]:
     return {
         "Immature": [f"{atlas}.Simplified.HSPC.predscore"],
-        "Mature":   [f"{atlas}.Simplified.{l}.predscore" for l in _SIMPLIFIED_NAMES if l != "HSPC"],
+        "Mature": [f"{atlas}.Simplified.{l}.predscore" for l in _SIMPLIFIED_NAMES if l != "HSPC"],
     }
 
 
-def _build_detailed_parentmap_for(atlas: str) -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {}
+def _build_detailed_parentmap_for(atlas: str) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
     for parent, allowed in DETAILED_PARENT_MAP.items():
-        cls_names = []
+        cls_names: List[str] = []
         for key in allowed:
             parts = str(key).split(".")
             if len(parts) >= 4 and parts[-1] == "predscore":
@@ -516,11 +501,11 @@ def _build_detailed_parentmap_for(atlas: str) -> dict[str, list[str]]:
     return out
 
 
-def Atlas_Broad_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 0.75):
+def Atlas_Broad_Annotation(adata_or_sample: Union[AnnData, Any], atlas: str, conf_threshold: float = 0.75):
     """Broad (Mature/Immature) from <Atlas>.Broad.*."""
     level_name = f"{atlas}.Broad"
     REF = {
-        "Mature":   [f"{atlas}.Broad.Mature.predscore"],
+        "Mature": [f"{atlas}.Broad.Mature.predscore"],
         "Immature": [f"{atlas}.Broad.Immature.predscore"],
     }
 
@@ -532,19 +517,22 @@ def Atlas_Broad_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 
             if k not in meta.obs:
                 raise KeyError(f"[{level_name}] Missing required column in row_attrs: {k}")
         voting_annotator(meta, level_name, REF, conf_threshold=conf_threshold)
-        _write_obs_to_row_attrs(sample, meta, [
-            f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"
-        ])
+        _write_obs_to_row_attrs(
+            sample,
+            meta,
+            [f"{level_name}.Celltype", f"{level_name}.Celltype.TopScore", f"{level_name}.Celltype.LowConf"],
+        )
         return sample
 
     adata = adata_or_sample
     for k in (f"{atlas}.Broad.Mature.predscore", f"{atlas}.Broad.Immature.predscore"):
-        if k not in adata.obs: raise KeyError(f"[{level_name}] Missing required column in adata.obs: {k}")
+        if k not in adata.obs:
+            raise KeyError(f"[{level_name}] Missing required column in adata.obs: {k}")
     voting_annotator(adata, level_name, REF, conf_threshold=conf_threshold)
     return adata
 
 
-def Atlas_Simplified_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 0.75):
+def Atlas_Simplified_Annotation(adata_or_sample: Union[AnnData, Any], atlas: str, conf_threshold: float = 0.75):
     """Constrained Simplified from <Atlas>.Simplified.* gated by <Atlas>.Broad.Celltype."""
     con_level = f"{atlas}.Constrained.Simplified"
 
@@ -554,28 +542,39 @@ def Atlas_Simplified_Annotation(adata_or_sample, atlas: str, conf_threshold: flo
             Atlas_Broad_Annotation(sample, atlas, conf_threshold=conf_threshold)
 
         meta = _make_meta_from_row_attrs(sample, list(sample.protein.row_attrs.keys()))
-        if f"{atlas}.Broad.Celltype" in sample.protein.row_attrs:
-            meta.obs[f"{atlas}.Broad.Celltype"] = np.asarray(sample.protein.row_attrs[f"{atlas}.Broad.Celltype"])
+        meta.obs[f"{atlas}.Broad.Celltype"] = np.asarray(sample.protein.row_attrs[f"{atlas}.Broad.Celltype"])
 
         avail = set(meta.obs.columns)
         classes = _runtime_class_map(_build_simplified_classmap_for(atlas), avail)
         parents = _runtime_parent_subset(_build_simplified_parentmap_for(atlas), avail)
 
         voting_annotator(
-            meta, con_level, classes,
+            meta,
+            con_level,
+            classes,
             parent_field=f"{atlas}.Broad.Celltype",
             parent_to_subset=parents,
             conf_threshold=conf_threshold,
+            normalize=True,
         )
 
+        # expose constrained predscores as <atlas>.Simplified.<lbl>.predscore.constrained
+        for lbl in _SIMPLIFIED_NAMES:
+            src = f"{con_level}.{lbl}.predscore"
+            if src in meta.obs.columns:
+                meta.obs[f"{atlas}.Simplified.{lbl}.predscore.constrained"] = meta.obs[src].astype(float)
+
+        # promote winners to <atlas>.Simplified.Celltype*
         meta.obs[f"{atlas}.Simplified.Celltype"] = meta.obs[f"{con_level}.Celltype"].astype(object)
         meta.obs[f"{atlas}.Simplified.Celltype.TopScore"] = meta.obs[f"{con_level}.Celltype.TopScore"].astype(float)
-        meta.obs[f"{atlas}.Simplified.Celltype.LowConf"]  = meta.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
+        meta.obs[f"{atlas}.Simplified.Celltype.LowConf"] = meta.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
 
         _write_obs_to_row_attrs(
-            sample, meta,
+            sample,
+            meta,
             [c for c in meta.obs.columns if c.startswith(f"{con_level}.") and c.endswith(".predscore")]
-            + [f"{atlas}.Simplified.Celltype", f"{atlas}.Simplified.Celltype.TopScore", f"{atlas}.Simplified.Celltype.LowConf"]
+            + [c for c in meta.obs.columns if c.startswith(f"{atlas}.Simplified.") and c.endswith(".predscore.constrained")]
+            + [f"{atlas}.Simplified.Celltype", f"{atlas}.Simplified.Celltype.TopScore", f"{atlas}.Simplified.Celltype.LowConf"],
         )
         return sample
 
@@ -588,17 +587,24 @@ def Atlas_Simplified_Annotation(adata_or_sample, atlas: str, conf_threshold: flo
     parents = _runtime_parent_subset(_build_simplified_parentmap_for(atlas), avail)
 
     voting_annotator(
-        adata, con_level, classes,
+        adata,
+        con_level,
+        classes,
         parent_field=f"{atlas}.Broad.Celltype",
         parent_to_subset=parents,
         conf_threshold=conf_threshold,
+        normalize=True,
     )
+
+    for lbl in _SIMPLIFIED_NAMES:
+        src = f"{con_level}.{lbl}.predscore"
+        if src in adata.obs.columns:
+            adata.obs[f"{atlas}.Simplified.{lbl}.predscore.constrained"] = adata.obs[src].astype(float)
 
     adata.obs[f"{atlas}.Simplified.Celltype"] = adata.obs[f"{con_level}.Celltype"].astype(object)
     adata.obs[f"{atlas}.Simplified.Celltype.TopScore"] = adata.obs[f"{con_level}.Celltype.TopScore"].astype(float)
-    adata.obs[f"{atlas}.Simplified.Celltype.LowConf"]  = adata.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
+    adata.obs[f"{atlas}.Simplified.Celltype.LowConf"] = adata.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
     return adata
-
 
 def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float = 0.6):
     """Constrained Detailed from <Atlas>.Detailed.* gated by <Atlas>.Simplified.Celltype."""
@@ -618,7 +624,9 @@ def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float
         parents = _runtime_parent_subset(_build_detailed_parentmap_for(atlas), avail)
 
         voting_annotator(
-            meta, con_level, classes,
+            meta,
+            con_level,
+            classes,
             parent_field=f"{atlas}.Simplified.Celltype",
             parent_to_subset=parents,
             conf_threshold=conf_threshold,
@@ -626,12 +634,13 @@ def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float
 
         meta.obs[f"{atlas}.Detailed.Celltype"] = meta.obs[f"{con_level}.Celltype"].astype(object)
         meta.obs[f"{atlas}.Detailed.Celltype.TopScore"] = meta.obs[f"{con_level}.Celltype.TopScore"].astype(float)
-        meta.obs[f"{atlas}.Detailed.Celltype.LowConf"]  = meta.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
+        meta.obs[f"{atlas}.Detailed.Celltype.LowConf"] = meta.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
 
         _write_obs_to_row_attrs(
-            sample, meta,
+            sample,
+            meta,
             [c for c in meta.obs.columns if c.startswith(f"{con_level}.") and c.endswith(".predscore")]
-            + [f"{atlas}.Detailed.Celltype", f"{atlas}.Detailed.Celltype.TopScore", f"{atlas}.Detailed.Celltype.LowConf"]
+            + [f"{atlas}.Detailed.Celltype", f"{atlas}.Detailed.Celltype.TopScore", f"{atlas}.Detailed.Celltype.LowConf"],
         )
         return sample
 
@@ -644,7 +653,9 @@ def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float
     parents = _runtime_parent_subset(_build_detailed_parentmap_for(atlas), avail)
 
     voting_annotator(
-        adata, con_level, classes,
+        adata,
+        con_level,
+        classes,
         parent_field=f"{atlas}.Simplified.Celltype",
         parent_to_subset=parents,
         conf_threshold=conf_threshold,
@@ -652,15 +663,19 @@ def Atlas_Detailed_Annotation(adata_or_sample, atlas: str, conf_threshold: float
 
     adata.obs[f"{atlas}.Detailed.Celltype"] = adata.obs[f"{con_level}.Celltype"].astype(object)
     adata.obs[f"{atlas}.Detailed.Celltype.TopScore"] = adata.obs[f"{con_level}.Celltype.TopScore"].astype(float)
-    adata.obs[f"{atlas}.Detailed.Celltype.LowConf"]  = adata.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
+    adata.obs[f"{atlas}.Detailed.Celltype.LowConf"] = adata.obs[f"{con_level}.Celltype.LowConf"].astype(bool)
     return adata
 
 
 _ATLAS_RE = re.compile(r"^(?P<atlas>[^.]+)\.(?P<level>Broad|Simplified|Detailed)\.(?P<class>[^.]+)\.predscore$")
+_LEGACY_ATLAS_COL = re.compile(r"^Atlas\.([^.]+)\.(Broad|Simplified|Detailed)\.([^.]+)\.predscore$")
+_UNWEIGHTED_AVG = re.compile(r"^Averaged\.Unweighted\.")
+_ATLAS_SCORE_RE = re.compile(r"^[^.]+\.(Broad|Simplified|Detailed)\.[^.]+\.predscore$")
+_AVG_SCORE_RE = re.compile(r"^Averaged\.(Broad|Simplified|Detailed)\.[^.]+\.predscore$")
 
 
 def add_Averaged_tracks(
-    obj: Union["AnnData", object],
+    obj: Union[AnnData, object],
     atlases: Sequence[str] = ("Hao", "Zhang", "Triana", "Luecken"),
     *,
     levels: Sequence[str] = ("Broad", "Simplified", "Detailed"),
@@ -670,7 +685,7 @@ def add_Averaged_tracks(
     atlas_name_value: str = "avg",
     apply_exclusions: bool = True,
 ) -> None:
-    """Average per-atlas predscores into Averaged.* tracks (now respecting EXCLUDE_ATLAS + per-class reweighting)."""
+    """Average per-atlas predscores into Averaged.* tracks (respecting EXCLUDE_ATLAS + per-class reweighting)."""
     is_anndata = isinstance(obj, AnnData)
     is_sample = _is_mosaic_sample(obj)
     if not (is_anndata or is_sample):
@@ -680,23 +695,37 @@ def add_Averaged_tracks(
         pending: dict[str, np.ndarray] = {}
         index = obj.obs.index
 
-        def has_key(k: str) -> bool: return (k in obj.obs.columns) or (k in pending)
-        def get_vec(k: str) -> np.ndarray: return pending.get(k, obj.obs[k].to_numpy())
-        def set_vec(k: str, v: np.ndarray): pending[k] = np.asarray(v).ravel()
+        def has_key(k: str) -> bool:
+            return (k in obj.obs.columns) or (k in pending)
+
+        def get_vec(k: str) -> np.ndarray:
+            return pending.get(k, obj.obs[k].to_numpy())
+
+        def set_vec(k: str, v: np.ndarray):
+            pending[k] = np.asarray(v).ravel()
+
         def list_keys() -> List[str]:
             base = [c for c in obj.obs.columns if not str(c).startswith("Atlas.")]
             extra = [c for c in pending.keys() if not str(c).startswith("Atlas.")]
             return list(set(base + extra))
+
     else:
         df_scaled = obj.protein.get_attribute("Scaled_reads", constraint="row+col")
         if not isinstance(df_scaled, pd.DataFrame):
             df_scaled = pd.DataFrame(df_scaled)
         index = df_scaled.index.astype(str)
 
-        def has_key(k: str) -> bool: return k in obj.protein.row_attrs
-        def get_vec(k: str) -> np.ndarray: return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
-        def set_vec(k: str, v: np.ndarray): obj.protein.row_attrs[k] = np.asarray(v).ravel()
-        def list_keys() -> List[str]: return [c for c in obj.protein.row_attrs.keys() if not str(c).startswith("Atlas.")]
+        def has_key(k: str) -> bool:
+            return k in obj.protein.row_attrs
+
+        def get_vec(k: str) -> np.ndarray:
+            return np.asarray(obj.protein.row_attrs[k]).reshape(-1)
+
+        def set_vec(k: str, v: np.ndarray):
+            obj.protein.row_attrs[k] = np.asarray(v).ravel()
+
+        def list_keys() -> List[str]:
+            return [c for c in obj.protein.row_attrs.keys() if not str(c).startswith("Atlas.")]
 
     n = len(index)
     cols = list_keys()
@@ -711,21 +740,18 @@ def add_Averaged_tracks(
         if atlas in atlases and level in levels:
             by_level_class.setdefault((level, klass), {})[atlas] = c
 
-    # normalise weights map to a dict[str,float] containing ATLAS-level priors
+    # Normalize weights (atlas priors)
     if weights is None:
         weights = {}
     else:
         weights = {str(k): float(v) for k, v in weights.items() if k in atlases}
 
     for (level, klass), atlas_cols in by_level_class.items():
-        # 1) apply per-label exclusions
         allowed = _filter_atlases_for_label_local(atlases, level, klass, apply_exclusions=apply_exclusions)
-        # 2) keep only present columns among allowed atlases
         present = [a for a in allowed if a in atlas_cols]
         if not present:
             continue
 
-        # 3) stack remaining columns
         mats = []
         for a in present:
             key = atlas_cols[a]
@@ -738,23 +764,20 @@ def add_Averaged_tracks(
             mats.append(v.reshape(1, -1))
         if not mats:
             continue
-        M = np.vstack(mats)  # shape: (#present, N)
+        M = np.vstack(mats)  # (#present, N)
 
-        # 4) weights over remaining atlases ONLY, renormalised to 1
+        # weights over remaining atlases ONLY
         if weights:
             w = np.array([max(0.0, float(weights.get(a, 0.0))) for a in present], dtype=float)
             if not np.isfinite(w).all():
                 w = np.nan_to_num(w, nan=0.0, neginf=0.0, posinf=0.0)
             if w.sum() <= 0.0:
-                # fallback to equal weights if all zero after exclusions
                 w = np.ones(len(present), dtype=float)
         else:
             w = np.ones(len(present), dtype=float)
         w = w / w.sum()
 
-        # 5) weighted mean across remaining
         avg = (w[:, None] * M).sum(axis=0)  # (N,)
-
         out_col = f"{out_prefix}{level}.{klass}.predscore"
         set_vec(out_col, avg)
 
@@ -762,7 +785,7 @@ def add_Averaged_tracks(
             atlas_col = f"{out_prefix}{level}.{klass}.atlas"
             set_vec(atlas_col, np.array([atlas_name_value] * n, dtype=object))
 
-    # write Averaged.<level>.pred/conf from newly created predscores
+    # Write Averaged.<level>.pred/conf from newly created predscores
     for level in levels:
         patt = re.compile(rf"^{re.escape(out_prefix)}{level}\.(.+)\.predscore$")
         class_names: List[str] = []
@@ -795,12 +818,8 @@ def add_Averaged_tracks(
         set_vec(f"{out_prefix}{level}.pred", pred)
         set_vec(f"{out_prefix}{level}.conf", conf)
 
-    if is_anndata and 'pending' in locals() and pending:
+    if is_anndata and "pending" in locals() and pending:
         _join_obs_cols(obj, pending)
-
-
-_LEGACY_ATLAS_COL = re.compile(r"^Atlas\.([^.]+)\.(Broad|Simplified|Detailed)\.([^.]+)\.predscore$")
-_UNWEIGHTED_AVG   = re.compile(r"^Averaged\.Unweighted\.")
 
 
 def _coerce_legacy_atlas_prefix(obj: Union[AnnData, Any]) -> None:
@@ -882,85 +901,335 @@ def _ensure_averaged_level_preds(obj, levels=("Broad", "Simplified", "Detailed")
         set_vec(f"Averaged.{level}.conf", conf)
 
 
-_ATLAS_SCORE_RE = re.compile(r"^[^.]+\.(Broad|Simplified|Detailed)\.[^.]+\.predscore$")
-_AVG_SCORE_RE   = re.compile(r"^Averaged\.(Broad|Simplified|Detailed)\.[^.]+\.predscore$")
+# -*- coding: utf-8 -*-
+"""
+Updated annotate_data function for hierarchical cell type annotation.
+
+This function:
+1. Looks at Broad depth → assigns highest Averaged.Broad predscore as identity
+2. Looks at Simplified depth → constrains by Broad ontology, renormalizes, assigns highest
+3. Looks at Detailed depth → constrains by Simplified ontology, renormalizes, assigns highest
+"""
+
+def _is_mosaic_sample(x: Any) -> bool:
+    """Check if object is a Mosaic Sample."""
+    return hasattr(x, "protein") and hasattr(x.protein, "row_attrs") and hasattr(x.protein, "get_attribute")
 
 
 def annotate_data(
-    obj,
+    obj: Union[AnnData, Any],
     models_path: Optional[Union[str, Path]] = None,
     data_path: Optional[Union[str, Path]] = None,
     *,
-    atlases: Sequence[str] = ("Hao", "Zhang", "Triana", "Luecken"),
-    weights: Optional[Mapping[str, float]] = None,  # <— pass-through for averaged weighting
-):
+    use_consensus: bool = False,  # Use Averaged.Consensus.* instead of Averaged.*
+    source_prefix: str = "Averaged.",  # Will be "Averaged.Consensus." if use_consensus=True
+) -> Union[AnnData, Any]:
     """
-    Ensure predictions exist and normalized naming is used, then compute:
-      - Averaged.<level>.pred/conf and constrained Celltype fields
-      - Per-atlas hierarchy-constrained <Atlas>.<level>.Celltype (when per-atlas predscores exist)
-
-    Also removes legacy 'Atlas.*' and 'Averaged.Unweighted.*' tracks.
+    Hierarchical cell type annotation using Averaged prediction scores.
+    
+    Process:
+    1. Broad depth: Assign highest Averaged.Broad.{label}.predscore as Broad identity
+    2. Simplified depth: 
+       - Constrain predscores based on Broad identity (ontology alignment)
+       - Renormalize so constrained predscores sum to 1
+       - Assign highest as Simplified identity
+    3. Detailed depth:
+       - Constrain predscores based on Simplified identity (ontology alignment)
+       - Renormalize so constrained predscores sum to 1
+       - Assign highest as Detailed identity
+    
+    Parameters
+    ----------
+    obj : AnnData or Sample
+        Object with prediction scores
+    models_path : str or Path, optional
+        Path to models (used if predictions don't exist)
+    data_path : str or Path, optional
+        Path to data (used if predictions don't exist)
+    use_consensus : bool, default=False
+        If True, use Averaged.Consensus.* tracks instead of Averaged.*
+    source_prefix : str, default="Averaged."
+        Prefix for source tracks (automatically set to "Averaged.Consensus." if use_consensus=True)
+    
+    Returns
+    -------
+    obj : AnnData or Sample
+        Object with added annotation columns:
+        - Averaged.Broad.Celltype
+        - Averaged.Simplified.Celltype  
+        - Averaged.Detailed.Celltype
     """
-    if isinstance(obj, AnnData):
-        keys = list(obj.obs.columns)
-    elif _is_mosaic_sample(obj):
-        keys = list(obj.protein.row_attrs.keys())
-    else:
+    
+    # Handle use_consensus flag
+    if use_consensus:
+        source_prefix = "Averaged.Consensus."
+    
+    is_anndata = isinstance(obj, AnnData)
+    is_sample = _is_mosaic_sample(obj)
+    
+    if not (is_anndata or is_sample):
         raise TypeError("annotate_data expects an AnnData or a missionbio.mosaic.sample.Sample")
-
-    has_atlas_scores = any(_ATLAS_SCORE_RE.match(str(k)) for k in keys)
-    has_avg_scores   = any(_AVG_SCORE_RE.match(str(k)) for k in keys)
-
-    if not (has_atlas_scores or has_avg_scores):
-        print("[annotate_data] No prediction tracks detected. Running generate_predictions...")
-        from .core import get_default_models_path, get_default_data_path, ensure_models_available
+    
+    # Import these here to avoid circular imports
+    from .constants import SIMPLIFIED_CLASSES, _DETAILED_LABELS
+    
+    # Define ontology mappings
+    # Broad -> Simplified
+    BROAD_TO_SIMPLIFIED = {
+        "Immature": ["HSPC"],
+        "Mature": [k for k in SIMPLIFIED_CLASSES.keys() if k != "HSPC"]
+    }
+    
+    # Simplified -> Detailed (from constants)
+    SIMPLIFIED_TO_DETAILED = {
+        "B": ["Pre-Pro-B", "Pro-B", "Pre-B", "Immature_B", "B_Naive", "B_Memory"],
+        "Plasma": ["Plasma"],
+        "CD4_T": ["CD4_T_Naive", "CD4_T_Memory", "CD4_CTL", "Treg"],
+        "CD8_T": ["CD8_T_Naive", "CD8_T_Memory", "MAIT"],
+        "Other_T": ["GdT", "MAIT"],
+        "NK": ["NK_CD56_bright", "NK_CD56_dim"],
+        "Monocyte": ["CD14_Mono", "CD16_Mono", "cDC1", "cDC2"],
+        "Myeloid": ["Myeloid_progenitor"],
+        "cDC": ["cDC1", "cDC2"],
+        "pDC": ["pDC"],
+        "Erythroid": ["Erythroblast", "ErP"],
+        "HSPC": ["HSC_MPP", "LMPP", "GMP", "MEP", "MkP", "EoBaMaP", "Pre-Pro-B", "Pro-B"],
+    }
+    
+    # Helper functions for getting/setting values
+    if is_anndata:
+        def has_col(col: str) -> bool:
+            return col in obj.obs.columns
+        
+        def get_col(col: str) -> np.ndarray:
+            return obj.obs[col].to_numpy()
+        
+        def set_col(col: str, vals: np.ndarray):
+            obj.obs[col] = vals
+        
+        def list_cols() -> List[str]:
+            return list(obj.obs.columns)
+        
+        n_cells = obj.n_obs
+    else:
+        def has_col(col: str) -> bool:
+            return col in obj.protein.row_attrs
+        
+        def get_col(col: str) -> np.ndarray:
+            return np.asarray(obj.protein.row_attrs[col]).reshape(-1)
+        
+        def set_col(col: str, vals: np.ndarray):
+            obj.protein.row_attrs[col] = np.asarray(vals)
+        
+        def list_cols() -> List[str]:
+            return list(obj.protein.row_attrs.keys())
+        
+        # Get number of cells from scaled data
+        df_scaled = obj.protein.get_attribute("Scaled_reads", constraint="row+col")
+        if not isinstance(df_scaled, pd.DataFrame):
+            df_scaled = pd.DataFrame(df_scaled)
+        n_cells = len(df_scaled.index)
+    
+    # Check if predictions exist
+    broad_cols = [f"{source_prefix}Broad.Mature.predscore", f"{source_prefix}Broad.Immature.predscore"]
+    has_predictions = all(has_col(c) for c in broad_cols)
+    
+    if not has_predictions:
+        print(f"[annotate_data] No {source_prefix}* prediction tracks found. Running generate_predictions...")
+        from .prediction import generate_predictions
+        from .model_loading import ensure_models_available, get_default_models_path, get_default_data_path
+        
         try:
             ensure_models_available()
         except Exception as e:
             print(f"[annotate_data] Warning: ensure_models_available failed: {e}")
-
+        
         if models_path is None:
             models_path = str(get_default_models_path())
             print(f"[annotate_data] Using default models path: {models_path}")
         if data_path is None:
             data_path = str(get_default_data_path())
             print(f"[annotate_data] Using default data path: {data_path}")
-
+        
         obj = generate_predictions(obj, models_path=models_path, data_path=data_path)
-
-    _coerce_legacy_atlas_prefix(obj)
-    _drop_unweighted_averaged(obj)
-
-    now_keys = list(obj.obs.columns) if isinstance(obj, AnnData) else list(obj.protein.row_attrs.keys())
-    if not any(_AVG_SCORE_RE.match(str(k)) for k in now_keys):
-        print("[annotate_data] Averaged.* predscores missing; creating via add_Averaged_tracks...")
-        add_Averaged_tracks(
-            obj,
-            atlases=atlases,
-            weights=weights,          # <— reweight across remaining atlases only
-            apply_exclusions=True,    # keep exclusions ON
-        )
-
-    _ensure_averaged_level_preds(obj, levels=("Broad", "Simplified", "Detailed"))
-
-    Broad_Annotation(obj)
-    Simplified_Annotation(obj)
-    Detailed_Annotation(obj)
-
-    present_keys = set(list(obj.obs.columns)) if isinstance(obj, AnnData) else set(list(obj.protein.row_attrs.keys()))
-    for atlas in atlases:
-        if f"{atlas}.Broad.Mature.predscore" in present_keys and f"{atlas}.Broad.Immature.predscore" in present_keys:
-            Atlas_Broad_Annotation(obj, atlas, conf_threshold=0.75)
-        if f"{atlas}.Simplified.NK.predscore" in present_keys or any(k.startswith(f"{atlas}.Simplified.") and k.endswith(".predscore") for k in present_keys):
-            Atlas_Simplified_Annotation(obj, atlas, conf_threshold=0.75)
-        if f"{atlas}.Detailed.CD14_Mono.predscore" in present_keys or any(k.startswith(f"{atlas}.Detailed.") and k.endswith(".predscore") for k in present_keys):
-            Atlas_Detailed_Annotation(obj, atlas, conf_threshold=0.60)
-
+    
+    # ============================================================================
+    # STEP 1: BROAD ANNOTATION (Immature vs Mature)
+    # ============================================================================
+    print("[annotate_data] Step 1: Broad annotation...")
+    
+    broad_labels = ["Immature", "Mature"]
+    broad_scores = np.zeros((n_cells, len(broad_labels)), dtype=float)
+    
+    for i, label in enumerate(broad_labels):
+        col = f"{source_prefix}Broad.{label}.predscore"
+        if has_col(col):
+            broad_scores[:, i] = get_col(col)
+        else:
+            raise KeyError(f"Missing required column: {col}")
+    
+    # Assign highest score as Broad identity
+    broad_winner_idx = broad_scores.argmax(axis=1)
+    broad_identity = np.array([broad_labels[i] for i in broad_winner_idx], dtype=object)
+    broad_conf = broad_scores[np.arange(n_cells), broad_winner_idx]
+    
+    set_col(f"{source_prefix}Broad.Celltype", broad_identity)
+    set_col(f"{source_prefix}Broad.Celltype.TopScore", broad_conf)
+    
+    print(f"  ✓ Broad annotation complete. Distribution:")
+    unique, counts = np.unique(broad_identity, return_counts=True)
+    for u, c in zip(unique, counts):
+        print(f"    {u}: {c} cells ({100*c/n_cells:.1f}%)")
+    
+    # ============================================================================
+    # STEP 2: SIMPLIFIED ANNOTATION (constrained by Broad)
+    # ============================================================================
+    print("[annotate_data] Step 2: Simplified annotation (constrained by Broad)...")
+    
+    simplified_labels = list(SIMPLIFIED_CLASSES.keys())
+    simplified_scores = np.zeros((n_cells, len(simplified_labels)), dtype=float)
+    
+    # Get raw scores
+    for i, label in enumerate(simplified_labels):
+        col = f"{source_prefix}Simplified.{label}.predscore"
+        if has_col(col):
+            simplified_scores[:, i] = get_col(col)
+    
+    # Apply Broad constraints and renormalize
+    constrained_simplified = np.zeros_like(simplified_scores)
+    
+    for cell_idx in range(n_cells):
+        broad_label = broad_identity[cell_idx]
+        allowed_simplified = BROAD_TO_SIMPLIFIED.get(broad_label, [])
+        
+        # Set scores to 0 for classes not allowed by ontology
+        for i, simp_label in enumerate(simplified_labels):
+            if simp_label in allowed_simplified:
+                constrained_simplified[cell_idx, i] = simplified_scores[cell_idx, i]
+            else:
+                constrained_simplified[cell_idx, i] = 0.0
+        
+        # Renormalize so they sum to 1
+        row_sum = constrained_simplified[cell_idx].sum()
+        if row_sum > 0:
+            constrained_simplified[cell_idx] = constrained_simplified[cell_idx] / row_sum
+        else:
+            # If all zeros (shouldn't happen), distribute uniformly among allowed
+            if allowed_simplified:
+                for i, simp_label in enumerate(simplified_labels):
+                    if simp_label in allowed_simplified:
+                        constrained_simplified[cell_idx, i] = 1.0 / len(allowed_simplified)
+    
+    # Store constrained predscores
+    for i, label in enumerate(simplified_labels):
+        col = f"{source_prefix}Simplified.{label}.predscore.constrained"
+        set_col(col, constrained_simplified[:, i])
+    
+    # Assign highest constrained score as Simplified identity
+    simplified_winner_idx = constrained_simplified.argmax(axis=1)
+    simplified_identity = np.array([simplified_labels[i] for i in simplified_winner_idx], dtype=object)
+    simplified_conf = constrained_simplified[np.arange(n_cells), simplified_winner_idx]
+    
+    set_col(f"{source_prefix}Simplified.Celltype", simplified_identity)
+    set_col(f"{source_prefix}Simplified.Celltype.TopScore", simplified_conf)
+    
+    print(f"  ✓ Simplified annotation complete. Top 5 classes:")
+    unique, counts = np.unique(simplified_identity, return_counts=True)
+    sorted_idx = np.argsort(-counts)
+    for idx in sorted_idx[:5]:
+        print(f"    {unique[idx]}: {counts[idx]} cells ({100*counts[idx]/n_cells:.1f}%)")
+    
+    # ============================================================================
+    # STEP 3: DETAILED ANNOTATION (constrained by Simplified)
+    # ============================================================================
+    print("[annotate_data] Step 3: Detailed annotation (constrained by Simplified)...")
+    
+    detailed_labels = _DETAILED_LABELS
+    detailed_scores = np.zeros((n_cells, len(detailed_labels)), dtype=float)
+    
+    # Get raw scores
+    for i, label in enumerate(detailed_labels):
+        col = f"{source_prefix}Detailed.{label}.predscore"
+        if has_col(col):
+            detailed_scores[:, i] = get_col(col)
+    
+    # Apply Simplified constraints and renormalize
+    constrained_detailed = np.zeros_like(detailed_scores)
+    
+    for cell_idx in range(n_cells):
+        simp_label = simplified_identity[cell_idx]
+        allowed_detailed = SIMPLIFIED_TO_DETAILED.get(simp_label, [])
+        
+        # Set scores to 0 for classes not allowed by ontology
+        for i, det_label in enumerate(detailed_labels):
+            if det_label in allowed_detailed:
+                constrained_detailed[cell_idx, i] = detailed_scores[cell_idx, i]
+            else:
+                constrained_detailed[cell_idx, i] = 0.0
+        
+        # Renormalize so they sum to 1
+        row_sum = constrained_detailed[cell_idx].sum()
+        if row_sum > 0:
+            constrained_detailed[cell_idx] = constrained_detailed[cell_idx] / row_sum
+        else:
+            # If all zeros (shouldn't happen), distribute uniformly among allowed
+            if allowed_detailed:
+                for i, det_label in enumerate(detailed_labels):
+                    if det_label in allowed_detailed:
+                        constrained_detailed[cell_idx, i] = 1.0 / len(allowed_detailed)
+    
+    # Store constrained predscores
+    for i, label in enumerate(detailed_labels):
+        col = f"{source_prefix}Detailed.{label}.predscore.constrained"
+        set_col(col, constrained_detailed[:, i])
+    
+    # Assign highest constrained score as Detailed identity
+    detailed_winner_idx = constrained_detailed.argmax(axis=1)
+    detailed_identity = np.array([detailed_labels[i] for i in detailed_winner_idx], dtype=object)
+    detailed_conf = constrained_detailed[np.arange(n_cells), detailed_winner_idx]
+    
+    set_col(f"{source_prefix}Detailed.Celltype", detailed_identity)
+    set_col(f"{source_prefix}Detailed.Celltype.TopScore", detailed_conf)
+    
+    print(f"  ✓ Detailed annotation complete. Top 10 classes:")
+    unique, counts = np.unique(detailed_identity, return_counts=True)
+    sorted_idx = np.argsort(-counts)
+    for idx in sorted_idx[:10]:
+        print(f"    {unique[idx]}: {counts[idx]} cells ({100*counts[idx]/n_cells:.1f}%)")
+    
+    print("[annotate_data] ✓ Hierarchical annotation complete!")
+    
     return obj
 
 
+# Example usage documentation:
+"""
+# For standard Averaged tracks:
+PBMC_HD01 = annotate_data(PBMC_HD01)
+
+# For consensus tracks (high-confidence only):
+PBMC_HD01 = annotate_data(PBMC_HD01, use_consensus=True)
+
+# Output columns created:
+# - Averaged.Broad.Celltype
+# - Averaged.Broad.Celltype.TopScore
+# - Averaged.Simplified.Celltype
+# - Averaged.Simplified.Celltype.TopScore
+# - Averaged.Simplified.{label}.predscore.constrained (for each label)
+# - Averaged.Detailed.Celltype
+# - Averaged.Detailed.Celltype.TopScore
+# - Averaged.Detailed.{label}.predscore.constrained (for each label)
+
+# If use_consensus=True:
+# - Averaged.Consensus.Broad.Celltype
+# - Averaged.Consensus.Simplified.Celltype
+# - Averaged.Consensus.Detailed.Celltype
+# (and corresponding .TopScore and .predscore.constrained columns)
+"""
+
+
 def _get_matrix_for_embedding(
-    obj: Union["AnnData", Any],
+    obj: Union[AnnData, Any],
     embedding_key: str = "X_umap",
     n_pca: int = 20,
 ) -> np.ndarray:
@@ -972,19 +1241,20 @@ def _get_matrix_for_embedding(
         X = np.asarray(X, dtype=float)
         n_comp = min(n_pca, X.shape[1]) if X.ndim == 2 and X.shape[1] > 1 else 1
         return X.reshape(-1, 1) if n_comp <= 1 else PCA(n_components=n_comp, random_state=0).fit_transform(X)
-    elif _is_mosaic_sample(obj):
+
+    if _is_mosaic_sample(obj):
         if "umap" in obj.protein.row_attrs:
             U = np.asarray(obj.protein.row_attrs["umap"])
             return U[:, :2] if U.ndim == 2 and U.shape[1] >= 2 else U.reshape(-1, 1)
+
         df = obj.protein.get_attribute("Scaled_reads", constraint="row+col")
         if not isinstance(df, pd.DataFrame):
             df = pd.DataFrame(df)
         X = df.values.astype(float)
         n_comp = min(n_pca, X.shape[1]) if X.shape[1] > 1 else 1
         return X.reshape(-1, 1) if n_comp <= 1 else PCA(n_components=n_comp, random_state=0).fit_transform(X)
-    else:
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample")
 
+    raise TypeError("Expected AnnData or missionbio.mosaic.sample")
 
 def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
     """Remove annotation-related columns and extraneous prob matrices."""
@@ -1004,45 +1274,53 @@ def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
     ]
 
     def matches(k: str) -> bool:
+        k = str(k)
         return any(p.search(k) for p in patterns)
 
     keep_embeddings = {"X_pca", "X_harmony", "X_umap"}
 
     if isinstance(obj, AnnData):
+        # obs columns
         drop_cols = [c for c in obj.obs.columns if matches(c)]
         if drop_cols:
-            obj.obs.drop(columns=drop_cols, inplace=True)
+            obj.obs.drop(columns=drop_cols, inplace=True, errors="ignore")
 
-        drop_obsm = [k for k in list(obj.obsm.keys())
-                     if (matches(k) or k.endswith(".probs")) and k not in keep_embeddings]
+        # obsm embeddings / probability matrices
+        drop_obsm = [
+            k for k in list(obj.obsm.keys())
+            if ((matches(k) or str(k).endswith(".probs")) and k not in keep_embeddings)
+        ]
         for k in drop_obsm:
             del obj.obsm[k]
 
     elif _is_mosaic_sample(obj):
         drop_attrs = [k for k in list(obj.protein.row_attrs.keys()) if matches(k)]
         for k in drop_attrs:
-            del obj.protein.row_attrs[k]
+            try:
+                del obj.protein.row_attrs[k]
+            except Exception:
+                pass
     else:
-        raise TypeError("Expected AnnData or missionbio.mosaic.sample")
+        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
 
     return obj
 
-
 def mark_mixed_clusters(
-    obj: Union["AnnData", any],
+    obj: Union["AnnData", Any],
     label_col: str,
     *,
     cluster_col: Optional[str] = None,
     min_frequency_threshold: float = 0.3,
     mixed_label: str = "Mixed",
-) -> Union["AnnData", any]:
+) -> Union["AnnData", Any]:
     """Relabel clusters with no dominant label as 'Mixed'."""
     is_anndata = isinstance(obj, AnnData)
-    is_sample  = _is_mosaic_sample(obj)
+    is_sample = _is_mosaic_sample(obj)
 
     if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or missionbio.mosaic sample")
+        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
 
+    # --- clusters vector ---
     if is_anndata:
         if cluster_col is None:
             for cand in ("leiden", "louvain", "clusters", "cluster"):
@@ -1055,11 +1333,12 @@ def mark_mixed_clusters(
     else:
         clusters = np.asarray(obj.protein.get_labels()).astype(str)
 
+    # --- labels vector ---
     if is_anndata:
         if label_col not in obj.obs.columns:
             raise KeyError(f"'{label_col}' not in adata.obs")
         labels = obj.obs[label_col]
-        was_cat = pd.api.types.is_categorical_dtype(labels)
+        was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
         labels_s = labels.astype(str)
     else:
         if label_col not in obj.protein.row_attrs:
@@ -1085,7 +1364,7 @@ def mark_mixed_clusters(
 
     if is_anndata:
         if was_cat:
-            cats = pd.Index(labels.cat.categories).astype(str)
+            cats = pd.Index(obj.obs[label_col].cat.categories).astype(str)
             if mixed_label not in cats:
                 cats = cats.append(pd.Index([mixed_label]))
             obj.obs[label_col] = pd.Categorical(updated, categories=cats)
@@ -1096,9 +1375,8 @@ def mark_mixed_clusters(
     obj.protein.row_attrs[label_col] = np.asarray(updated.values, dtype=object)
     return obj
 
-
 def refine_labels_by_knn_consensus(
-    obj: Union["AnnData", any],
+    obj: Union["AnnData", Any],
     label_col: str = "Averaged.Detailed.Celltype",
     embedding_key: str = "X_umap",
     *,
@@ -1114,9 +1392,9 @@ def refine_labels_by_knn_consensus(
 ):
     """Safer relabeling via local KNN consensus + outlier checks."""
     is_anndata = isinstance(obj, AnnData)
-    is_sample  = _is_mosaic_sample(obj)
+    is_sample = _is_mosaic_sample(obj)
     if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or missionbio.mosaic.Sample")
+        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
 
     out_col = out_col or f"{label_col}_refined_consensus"
 
@@ -1127,7 +1405,7 @@ def refine_labels_by_knn_consensus(
         if label_col not in obj.obs.columns:
             raise KeyError(f"'{label_col}' not in adata.obs")
         labels = obj.obs[label_col]
-        was_cat = pd.api.types.is_categorical_dtype(labels)
+        was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
         labels_s = labels.astype(str)
         idx_like = obj.obs_names
     else:
@@ -1143,11 +1421,12 @@ def refine_labels_by_knn_consensus(
         idx_like = pd.Index(range(X.shape[0]))
 
     n = X.shape[0]
-    k = max(2, min(k_neighbors, n - 1))
+    k = max(2, min(int(k_neighbors), n - 1))
 
     counts = labels_s.value_counts()
-    frequent = set(counts[counts >= min_label_size].index)
+    frequent = set(counts[counts >= int(min_label_size)].index)
 
+    # robust z-score to centroid within label
     z = np.full(n, np.nan, dtype=float)
     for lab, idx_lab in labels_s.groupby(labels_s).groups.items():
         idx_arr = np.fromiter(idx_lab, dtype=int)
@@ -1162,12 +1441,12 @@ def refine_labels_by_knn_consensus(
 
     nn = NearestNeighbors(n_neighbors=k + 1, metric="euclidean")
     nn.fit(X)
-    dists, neigh = nn.kneighbors(X, return_distance=True)
-    neigh = neigh[:, 1:]
-    neigh = neigh[:, :k]
+    _, neigh = nn.kneighbors(X, return_distance=True)
+    neigh = neigh[:, 1:][:, :k]
 
     neigh_labels = labels_s.iloc[neigh.reshape(-1)].to_numpy().reshape(n, -1)
-    top_label = []
+
+    top_label = np.empty(n, dtype=object)
     top_frac = np.zeros(n, dtype=float)
     self_frac = np.zeros(n, dtype=float)
 
@@ -1175,17 +1454,16 @@ def refine_labels_by_knn_consensus(
         vals, ct = np.unique(neigh_labels[i], return_counts=True)
         order = np.argsort(-ct)
         vals, ct = vals[order], ct[order]
-        top_label.append(vals[0])
+        top_label[i] = vals[0]
         top_frac[i] = ct[0] / float(neigh_labels.shape[1])
         cur = labels_s.iloc[i]
         self_ct = ct[vals == cur].sum() if np.any(vals == cur) else 0
         self_frac[i] = self_ct / float(neigh_labels.shape[1])
 
-    top_label = np.asarray(top_label, dtype=object)
     margin = top_frac - self_frac
-
     cur_labels = labels_s.to_numpy()
     candidate = top_label
+
     flip_mask = (
         (candidate != cur_labels) &
         (top_frac >= float(min_neighbor_frac)) &
@@ -1195,12 +1473,13 @@ def refine_labels_by_knn_consensus(
 
     to_flip_idx = np.where(flip_mask)[0]
     if to_flip_idx.size:
-        order = np.argsort(-margin[to_flip_idx])
-        to_flip_idx = to_flip_idx[order]
+        to_flip_idx = to_flip_idx[np.argsort(-margin[to_flip_idx])]
 
         final_idx = []
         per_src_used: Dict[str, int] = {}
-        per_src_cap: Dict[str, int] = {lab: int(np.floor(c * float(per_label_cap))) for lab, c in counts.items()}
+        per_src_cap: Dict[str, int] = {
+            lab: int(np.floor(c * float(per_label_cap))) for lab, c in counts.items()
+        }
 
         for i in to_flip_idx:
             src = cur_labels[i]
@@ -1209,7 +1488,7 @@ def refine_labels_by_knn_consensus(
             used = per_src_used.get(src, 0)
             if used < per_src_cap[src]:
                 per_src_used[src] = used + 1
-                final_idx.append(i)
+                final_idx.append(int(i))
 
         gcap = int(np.floor(n * float(global_cap)))
         if len(final_idx) > gcap:
@@ -1217,42 +1496,49 @@ def refine_labels_by_knn_consensus(
     else:
         final_idx = []
 
+    final_idx_arr = np.asarray(final_idx, dtype=int)
+
     new_labels = labels_s.copy()
-    if final_idx:
-        new_labels.iloc[final_idx] = candidate[final_idx]
+    if final_idx_arr.size:
+        new_labels.iloc[final_idx_arr] = candidate[final_idx_arr]
 
     if is_anndata:
         if was_cat:
-            cats = pd.Index(labels.cat.categories).astype(str)
-            extra = np.setdiff1d(np.unique(new_labels), cats)
-            cats = cats.append(pd.Index(extra))
-            obj.obs[out_col] = pd.Categorical(new_labels, categories=cats)
+            cats = pd.Index(obj.obs[label_col].cat.categories).astype(str)
+            new_unique = pd.Index(pd.unique(new_labels.astype(str)))
+            extra = new_unique.difference(cats)
+            cats = cats.append(extra)
+            obj.obs[out_col] = pd.Categorical(new_labels.astype(str), categories=cats)
         else:
             obj.obs[out_col] = new_labels
+
         if debug_cols:
             obj.obs[f"{out_col}__knn_top_frac"] = top_frac
             obj.obs[f"{out_col}__knn_self_frac"] = self_frac
             obj.obs[f"{out_col}__centroid_robust_z"] = z
             obj.obs[f"{out_col}__flip"] = False
-            obj.obs.loc[idx_like[np.asarray(final_idx, dtype=int)], f"{out_col}__flip"] = True
+            if final_idx_arr.size:
+                obj.obs.loc[idx_like[final_idx_arr], f"{out_col}__flip"] = True
 
         per_label_changes = {}
-        if final_idx:
-            src_series = pd.Series(cur_labels[np.asarray(final_idx, dtype=int)])
+        if final_idx_arr.size:
+            src_series = pd.Series(cur_labels[final_idx_arr])
             per_label_changes = src_series.value_counts().astype(int).to_dict()
-        return int(len(final_idx)), obj.obs[out_col], obj, per_label_changes
 
+        return int(final_idx_arr.size), obj.obs[out_col], obj, per_label_changes
+
+    # Sample-like
     obj.protein.row_attrs[out_col] = np.asarray(new_labels.values, dtype=object)
     if debug_cols:
         obj.protein.row_attrs[f"{out_col}__knn_top_frac"] = top_frac.astype(float)
         obj.protein.row_attrs[f"{out_col}__knn_self_frac"] = self_frac.astype(float)
         obj.protein.row_attrs[f"{out_col}__centroid_robust_z"] = z.astype(float)
         flip_vec = np.zeros(n, dtype=bool)
-        if final_idx:
-            flip_vec[np.asarray(final_idx, dtype=int)] = True
+        if final_idx_arr.size:
+            flip_vec[final_idx_arr] = True
         obj.protein.row_attrs[f"{out_col}__flip"] = flip_vec
-    return obj
 
+    return obj
 
 def score_mixed_clusters(
     obj: Union["AnnData", Any],
@@ -1261,7 +1547,7 @@ def score_mixed_clusters(
     *,
     embedding_key: str = "X_umap",
     n_pca: int = 20,
-    weights: Dict[str, float] = None,
+    weights: Optional[Dict[str, float]] = None,
     min_cells_for_silhouette: int = 2,
 ) -> pd.DataFrame:
     """Quantify cluster mixing via label entropy and embedding cohesion."""
@@ -1289,7 +1575,8 @@ def score_mixed_clusters(
 
     sil = np.full(Z.shape[0], np.nan, dtype=float)
     uniq_clusters = np.unique(cvec)
-    if uniq_clusters.size >= 2 and all((cvec == u).sum() >= min_cells_for_silhouette for u in uniq_clusters):
+
+    if uniq_clusters.size >= 2 and all((cvec == u).sum() >= int(min_cells_for_silhouette) for u in uniq_clusters):
         try:
             sil = silhouette_samples(Z, cvec, metric="euclidean")
         except Exception:
@@ -1300,8 +1587,8 @@ def score_mixed_clusters(
         idx = (cvec == cl)
         n = int(idx.sum())
         labs = lvec[idx]
-        _, counts = np.unique(labs, return_counts=True)
-        p = counts / counts.sum()
+        _, cts = np.unique(labs, return_counts=True)
+        p = cts / cts.sum()
 
         majority_frac = float(p.max())
         if len(p) > 1:
@@ -1311,32 +1598,34 @@ def score_mixed_clusters(
         else:
             entropy_norm = 0.0
 
-        s = np.nanmean(sil[idx]) if np.any(idx) else np.nan
+        s = float(np.nanmean(sil[idx])) if np.any(idx) else np.nan
         mix_from_entropy = entropy_norm
         mix_from_sil = 0.5 if np.isnan(s) else (1.0 - s) * 0.5
 
-        rows.append({
-            "cluster": cl,
-            "n_cells": n,
-            "majority_frac": majority_frac,
-            "entropy_norm": entropy_norm,
-            "silhouette_mean": s,
-            "mix_from_entropy": mix_from_entropy,
-            "mix_from_sil": mix_from_sil,
-        })
+        rows.append(
+            {
+                "cluster": cl,
+                "n_cells": n,
+                "majority_frac": majority_frac,
+                "entropy_norm": entropy_norm,
+                "silhouette_mean": s,
+                "mix_from_entropy": mix_from_entropy,
+                "mix_from_sil": mix_from_sil,
+            }
+        )
 
     df = pd.DataFrame(rows).set_index("cluster")
 
     if weights is None:
         weights = {"entropy": 0.6, "silhouette": 0.4}
+
     w_e = float(weights.get("entropy", 0.6))
     w_s = float(weights.get("silhouette", 0.4))
-    w_sum = w_e + w_s if (w_e + w_s) > 0 else 1.0
+    w_sum = (w_e + w_s) if (w_e + w_s) > 0 else 1.0
     w_e, w_s = w_e / w_sum, w_s / w_sum
 
     df["mixed_likelihood"] = w_e * df["mix_from_entropy"].values + w_s * df["mix_from_sil"].values
     return df.sort_values("mixed_likelihood", ascending=False)
-
 
 def mark_small_clusters(
     obj: Union["AnnData", Any],
@@ -1350,31 +1639,31 @@ def mark_small_clusters(
     is_sample = _is_mosaic_sample(obj)
 
     if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or missionbio.mosaic.Sample")
+        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
 
     if is_anndata:
         if label_col not in obj.obs.columns:
             raise KeyError(f"'{label_col}' not found in adata.obs")
         labels = obj.obs[label_col]
-        was_categorical = pd.api.types.is_categorical_dtype(labels)
+        was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
         labels_s = labels.astype(str)
     else:
         if label_col not in obj.protein.row_attrs:
             raise KeyError(f"'{label_col}' not found in Sample.protein.row_attrs")
         arr = np.asarray(obj.protein.row_attrs[label_col])
         labels_s = pd.Series(arr.astype(str))
-        was_categorical = False
+        was_cat = False
 
     counts = labels_s.value_counts()
-    small = counts[counts < min_cells].index
+    small = counts[counts < int(min_cells)].index
     updated = labels_s.replace(dict.fromkeys(small, small_label))
 
     if is_anndata:
-        if was_categorical:
-            cats = pd.Index(labels.cat.categories).astype(str)
+        if was_cat:
+            cats = pd.Index(obj.obs[label_col].cat.categories).astype(str)
             if small_label not in cats:
                 cats = cats.append(pd.Index([small_label]))
-            obj.obs[label_col] = pd.Categorical(updated, categories=cats)
+            obj.obs[label_col] = pd.Categorical(updated.astype(str), categories=cats)
         else:
             obj.obs[label_col] = updated
         return obj
@@ -1382,8 +1671,6 @@ def mark_small_clusters(
     obj.protein.row_attrs[label_col] = np.asarray(updated.values, dtype=object)
     return obj
 
-
-# Utility used above to merge 'pending' obs columns into adata.obs
 def _join_obs_cols(adata: AnnData, pending: Mapping[str, np.ndarray]) -> None:
     for k, v in pending.items():
         adata.obs[k] = v
