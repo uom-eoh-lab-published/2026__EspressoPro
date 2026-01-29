@@ -47,32 +47,52 @@ sample.protein.cluster(
 sample = ep.generate_predictions(obj=sample)  
 sample = ep.annotate_data(obj=sample)
 
-# Optional: add custom celltype-signature-based calls
-sample = ep.add_signature_annotation(
+# Optional: rename clusters with less than N cells to Small (potential noise)
+sample = ep.mark_small_clusters(
     sample,
-    layer="Normalized_reads",
-    positive_markers=['CD14', 'CD33', 'CD11b', 'CD64'],
-    negative_markers='',
-    cell_type_label="CD14_mono",
-    verbose=True
+    label_in="Averaged.Detailed.Celltype",
+    label_out="Averaged.Detailed.Celltype.Small",
+    cluster_col="Clusters",
+    min_cells=3,
+)
+
+# Optional: rename clusters with no single annotation as mixed according to label frequencies
+sample = ep.mark_mixed_clusters(
+    sample,
+    label_in="Averaged.Detailed.Celltype",
+    label_out="Averaged.Detailed.Celltype.Mixed",
+    cluster_col="Clusters",
+    min_frequency_threshold=0.35,
+)
+
+# Optional: expand cell type labels to clusters and rename mixed if not done earlier
+sample, summary, pivot = ep.suggest_cluster_celltype_identity(
+    sample=sample,
+    dominance_threshold=0.35,
+    label_in="Averaged.Detailed.Celltype",
+    cluster_col="Clusters",
+    label_out="Averaged.Detailed.Celltype.Refined"
 )
 
 # Optional: add predefined celltype-signature-based calls
 sample = ep.add_mast_annotation(
     sample,
     layer="Normalized_reads",
-    verbose=True
+    label_in='Averaged.Detailed.Celltype',
+    label_out='Averaged.Detailed.Celltype.Custom',
 )
 
-# Optional: expand cell type labels to clusters
-sample, summary, pivot = ep.suggest_cluster_celltype_identity(
-    sample=sample,
-    dominance_threshold=0.35,
-    annotation_col="Averaged.Detailed.Celltype",
-    cluster_col="Clusters",
-    rewrite=True,
-    verbose=True
+# Optional: add custom celltype-signature-based calls
+sample = ep.add_signature_annotation(
+    sample,
+    layer="Normalized_reads",
+    label_in='Averaged.Detailed.Celltype',
+    label_out='Averaged.Detailed.Celltype.Custom',
+    positive_markers=["CD14", "CD33", "CD11b", "CD64"],
+    negative_markers="",
+    cell_type_label="CD14_Mono"
 )
+
 ```
 
 **Full tutorial:** [MissionBio_Tapestri.ipynb](https://github.com/uom-eoh-lab-published/2026__EspressoPro/blob/main/tutorials/MissionBio_Tapestri.ipynb)
