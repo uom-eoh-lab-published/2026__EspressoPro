@@ -101,7 +101,7 @@ sample = ep.add_signature_annotation(
 
 ## Repositories  
 
-- Model: <https://huggingface.co/EspressoKris/EspressoPro>  
+- Models: <https://huggingface.co/EspressoKris/EspressoPro>  
 
 ## Documentation
 
