@@ -103,7 +103,6 @@ sample = ep.add_signature_annotation(
 
 ## Documentation
 
-- Docs: <https://espressopro.readthedocs.io>  
 - Manuscript: <https://github.com/uom-eoh-lab-published/2026__EspressoPro_Manuscript>
 
 ## Citation
