@@ -20,7 +20,7 @@ conda activate mosaic
 pip install git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git
 ```
 
-In alternative used the same provided within https://github.com/uom-eoh-lab-published/2026__EspressoPro/blob/main/tutorials/Environments/mosaic_2.yml  
+In alternative used the same environment [provided](https://github.com/uom-eoh-lab-published/2026__EspressoPro/blob/main/tutorials/Environments/mosaic_2.yml) within the tutorial repository.  
 
 ## Quick start
 
