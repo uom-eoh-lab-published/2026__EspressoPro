@@ -99,8 +99,5 @@ DETAILED_PARENT_MAP = {
 }
 
 # Mast cell signatures
-MAST_POS = ['FcεRIα', 'CD117', 'CD62L']
-MAST_NEG = [
-    'CD303', 'CD304', 'CD123', 'CD34', 'CD8', 'CD4',
-    'CD138', 'CD7', 'CD10', 'CD11b', 'CD5', 'CD141', 'CD1c',
-]
+MAST_POS = ['CD2', 'CD25', 'CD30', 'CD33', 'CD117', 'FcεRIα']
+MAST_NEG = ['']
