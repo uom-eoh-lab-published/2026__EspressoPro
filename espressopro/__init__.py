@@ -25,33 +25,44 @@ _HAS_CONSENSUS = False
 _HAS_CONSENSUS_SAMPLE = False
 _HAS_UNWEIGHTED_AVG = False
 
-# core prediction API (must exist)
-from .prediction import stack_prediction, generate_predictions
-
-# optional utilities
 try:
-    from .prediction import audit_feature_overlap
-except ImportError:
+    from .prediction import stack_prediction  # noqa: F401
+    _HAS_STACK_PREDICTION = True
+except Exception:
     pass
 
 try:
-    from .prediction import add_best_localised_tracks
-except ImportError:
+    from .prediction import generate_predictions  # noqa: F401
+    _HAS_GENERATE_PREDICTIONS = True
+except Exception:
     pass
 
 try:
-    from .prediction import add_consensus_weighted_tracks
-except ImportError:
+    from .prediction import audit_feature_overlap  # noqa: F401
+    _HAS_AUDIT_FEATURE_OVERLAP = True
+except Exception:
     pass
 
 try:
-    from .prediction import add_consensus_weighted_tracks_sample  # type: ignore
+    from .prediction import add_best_localised_tracks  # noqa: F401
+    _HAS_BEST_LOCALISED = True
+except Exception:
+    pass
+
+try:
+    from .prediction import add_consensus_weighted_tracks  # noqa: F401
+    _HAS_CONSENSUS = True
+except Exception:
+    pass
+
+try:
+    from .prediction import add_consensus_weighted_tracks_sample  # noqa: F401
     _HAS_CONSENSUS_SAMPLE = True
 except Exception:
     pass
 
 try:
-    from .prediction import add_unweighted_average_tracks, add_unweighted_average_tracks_sample  # type: ignore
+    from .prediction import add_unweighted_average_tracks, add_unweighted_average_tracks_sample  # noqa: F401
     _HAS_UNWEIGHTED_AVG = True
 except Exception:
     pass
@@ -96,6 +107,7 @@ from .missionbio import (
 )
 
 # ------------------------------- markers ------------------------------
+# (updated: pyUCell/GMM-based add_signature_annotation + add_mast_annotation live here)
 
 from .markers import add_mast_annotation, add_signature_annotation
 
@@ -137,7 +149,7 @@ __all__ = [
     "suggest_cluster_celltype_identity",
     "reassign_disconnected_cells",
     "print_disconnected_summary",
-    "print_cluster_suggestions"
+    "print_cluster_suggestions",
 
     # Markers
     "add_mast_annotation",
