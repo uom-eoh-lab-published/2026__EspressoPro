@@ -45,10 +45,24 @@ sample.protein.cluster(
 
 # Cell type annotation
 sample = ep.generate_predictions(obj=sample)  
-sample = ep.annotate_data(obj=sample)  
+sample = ep.annotate_data(obj=sample)
 
-# Optional: add marker-based calls
-sample = ep.add_mast_annotation(sample, )
+# Optional: add custom celltype-signature-based calls
+sample = ep.add_signature_annotation(
+    sample,
+    layer="Normalized_reads",
+    positive_markers=['CD14', 'CD33', 'CD11b', 'CD64'],
+    negative_markers='',
+    cell_type_label="CD14_mono",
+    verbose=True
+)
+
+# Optional: add predefined celltype-signature-based calls
+sample = ep.add_mast_annotation(
+    sample,
+    layer="Normalized_reads",
+    verbose=True
+)
 
 # Optional: expand cell type labels to clusters
 sample, summary, pivot = ep.suggest_cluster_celltype_identity(

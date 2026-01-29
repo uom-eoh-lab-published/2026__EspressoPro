@@ -15,7 +15,7 @@ def reassign_disconnected_cells(
     embedding_key: str = "pca",
     *,
     rewrite: bool = False,
-    out_key: str = "spatially_refined_labels",
+    label_out: str = "spatially_refined_labels",
     verbose: bool = False,
 ):
     """
@@ -49,8 +49,8 @@ def reassign_disconnected_cells(
         Key in sample.protein.row_attrs for the embedding to use.
         Options: 'pca', 'umap'. Default is 'pca'.
     rewrite : bool
-        If True, write reassigned labels to sample.protein.row_attrs[out_key].
-    out_key : str
+        If True, write reassigned labels to sample.protein.row_attrs[label_out].
+    label_out : str
         Row attribute name used when rewrite=True.
     verbose : bool
         If True, print detailed information about reassignments.
@@ -212,7 +212,7 @@ def reassign_disconnected_cells(
         return reassigned_labels, disconnected_info
     
     # Write to sample and return the modified sample
-    sample.protein.row_attrs[out_key] = reassigned_labels
+    sample.protein.row_attrs[label_out] = reassigned_labels
     return sample
 
 
@@ -251,10 +251,10 @@ import pandas as pd
 
 def suggest_cluster_celltype_identity(
     sample,
-    annotation_col: str = "Averaged.Detailed.Celltype",
+    label_in: str = "Averaged.Detailed.Celltype",
     cluster_col: str = "cluster",
     dominance_threshold: float = 0.55,
-    out_key: str = "annotated_clusters",
+    label_out: str = "annotated_clusters",
     rewrite: bool = True,
     verbose: bool = False,
 ):
@@ -264,7 +264,7 @@ def suggest_cluster_celltype_identity(
     Rules
     -----
     For each cluster:
-      - Compute label frequencies from row_attrs[annotation_col]
+      - Compute label frequencies from row_attrs[label_in]
       - If top label frequency >= dominance_threshold:
             assign top label to all cells
         else:
@@ -275,12 +275,12 @@ def suggest_cluster_celltype_identity(
 
     ra = sample.protein.row_attrs
 
-    if annotation_col not in ra:
-        raise KeyError(f"'{annotation_col}' not found in sample.protein.row_attrs")
+    if label_in not in ra:
+        raise KeyError(f"'{label_in}' not found in sample.protein.row_attrs")
     if cluster_col not in ra:
         raise KeyError(f"'{cluster_col}' not found in sample.protein.row_attrs")
 
-    labels = np.asarray(ra[annotation_col], dtype=object)
+    labels = np.asarray(ra[label_in], dtype=object)
     clusters = np.asarray(ra[cluster_col], dtype=object)
 
     n = len(labels)
@@ -348,7 +348,7 @@ def suggest_cluster_celltype_identity(
     )
 
     if rewrite:
-        ra[out_key] = assigned
+        ra[label_out] = assigned
         return sample, summary, pivot
 
     return summary, pivot

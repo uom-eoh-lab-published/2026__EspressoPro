@@ -60,10 +60,12 @@ def _filter_atlases_for_label_local(
     banned = EXCLUDE_ATLAS.get(depth, {}).get(label, set())
     return [a for a in atlases if a not in banned]
 
-
 def _is_mosaic_sample(x: Any) -> bool:
+    """
+    MissionBio Sample-ish object detector.
+    We require row_attrs + get_attribute (used throughout for feature access).
+    """
     return hasattr(x, "protein") and hasattr(x.protein, "row_attrs") and hasattr(x.protein, "get_attribute")
-
 
 def _class_from_key(k: str) -> str:
     # expects something like: "<prefix>.<Class>.predscore"  -> returns "<Class>"
@@ -778,8 +780,8 @@ def add_Averaged_tracks(
         w = w / w.sum()
 
         avg = (w[:, None] * M).sum(axis=0)  # (N,)
-        out_col = f"{out_prefix}{level}.{klass}.predscore"
-        set_vec(out_col, avg)
+        label_out = f"{out_prefix}{level}.{klass}.predscore"
+        set_vec(label_out, avg)
 
         if write_atlas_name:
             atlas_col = f"{out_prefix}{level}.{klass}.atlas"
@@ -910,11 +912,6 @@ This function:
 2. Looks at Simplified depth → constrains by Broad ontology, renormalizes, assigns highest
 3. Looks at Detailed depth → constrains by Simplified ontology, renormalizes, assigns highest
 """
-
-def _is_mosaic_sample(x: Any) -> bool:
-    """Check if object is a Mosaic Sample."""
-    return hasattr(x, "protein") and hasattr(x.protein, "row_attrs") and hasattr(x.protein, "get_attribute")
-
 
 def annotate_data(
     obj: Union[AnnData, Any],
@@ -1201,7 +1198,6 @@ def annotate_data(
     
     return obj
 
-
 # Example usage documentation:
 """
 # For standard Averaged tracks:
@@ -1256,287 +1252,157 @@ def _get_matrix_for_embedding(
 
     raise TypeError("Expected AnnData or missionbio.mosaic.sample")
 
-def clear_annotation(obj: Union[AnnData, Any]) -> Union[AnnData, Any]:
-    """Remove annotation-related columns and extraneous prob matrices."""
-    patterns = [
-        re.compile(r"\.pred$", re.IGNORECASE),
-        re.compile(r"\.predscore$", re.IGNORECASE),
-        re.compile(r"\.score$", re.IGNORECASE),
-        re.compile(r"\.triple$", re.IGNORECASE),
-        re.compile(r"\.lowconf$", re.IGNORECASE),
-        re.compile(r"\.atlas$", re.IGNORECASE),
-        re.compile(r"\.conf$", re.IGNORECASE),
-        re.compile(r"__centroid_dist$", re.IGNORECASE),
-        re.compile(r"__centroid_robust_z$", re.IGNORECASE),
-        re.compile(r"_pos$", re.IGNORECASE),
-        re.compile(r"_neg$", re.IGNORECASE),
-        re.compile(r"_signature$", re.IGNORECASE),
-    ]
+import re
+from typing import Any, Union
 
-    def matches(k: str) -> bool:
-        k = str(k)
-        return any(p.search(k) for p in patterns)
+def clear_annotation(obj: Any) -> Any:
+    """
+    For missionbio.mosaic Sample-like objects:
+    - Keep only Averaged.(Broad|Simplified|Detailed).Celltype* keys (and their derived variants)
+    - Keep a small set of core non-annotation fields (barcode/umap/etc)
+    - Delete everything else from sample.protein.row_attrs
+    """
+    if not _is_mosaic_sample(obj):
+        raise TypeError("Expected a missionbio.mosaic Sample-like object")
 
-    keep_embeddings = {"X_pca", "X_harmony", "X_umap"}
+    ra = obj.protein.row_attrs
 
-    if isinstance(obj, AnnData):
-        # obs columns
-        drop_cols = [c for c in obj.obs.columns if matches(c)]
-        if drop_cols:
-            obj.obs.drop(columns=drop_cols, inplace=True, errors="ignore")
+    # --- Always keep these non-annotation fields (edit as needed)
+    keep_core = {
+        "barcode",
+        "label",
+        "sample_name",
+        "umap",
+        "pca",
+        "Clusters",   # your cluster IDs
+    }
 
-        # obsm embeddings / probability matrices
-        drop_obsm = [
-            k for k in list(obj.obsm.keys())
-            if ((matches(k) or str(k).endswith(".probs")) and k not in keep_embeddings)
-        ]
-        for k in drop_obsm:
-            del obj.obsm[k]
+    # --- Keep ONLY these annotation keys
+    keep_re = re.compile(
+        r"^Averaged\.(Broad|Simplified|Detailed)\.Celltype(\..*)?$"
+    )
 
-    elif _is_mosaic_sample(obj):
-        drop_attrs = [k for k in list(obj.protein.row_attrs.keys()) if matches(k)]
-        for k in drop_attrs:
-            try:
-                del obj.protein.row_attrs[k]
-            except Exception:
-                pass
-    else:
-        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
+    keep_keys = {k for k in ra.keys() if (k in keep_core) or keep_re.match(str(k))}
+    drop_keys = [k for k in list(ra.keys()) if k not in keep_keys]
+
+    for k in drop_keys:
+        try:
+            del ra[k]
+        except Exception:
+            pass
 
     return obj
 
+from typing import Any, Optional, Union
+
+import numpy as np
+import pandas as pd
+
+try:
+    from anndata import AnnData
+except Exception:
+    AnnData = object  # type: ignore[misc,assignment]
+
 def mark_mixed_clusters(
     obj: Union["AnnData", Any],
-    label_col: str,
+    label_in: str,
     *,
     cluster_col: Optional[str] = None,
     min_frequency_threshold: float = 0.3,
     mixed_label: str = "Mixed",
+    label_out: Optional[str] = None,
 ) -> Union["AnnData", Any]:
-    """Relabel clusters with no dominant label as 'Mixed'."""
+    """
+    Relabel clusters with no dominant label as 'Mixed' (frequency-only),
+    using the same logic as suggest_cluster_celltype_identity().
+
+    If label_out is provided:
+        - copy label_in -> label_out
+        - apply Mixed relabeling to label_out
+    Else:
+        - modify label_in in place
+    """
     is_anndata = isinstance(obj, AnnData)
     is_sample = _is_mosaic_sample(obj)
 
     if not (is_anndata or is_sample):
         raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
 
-    # --- clusters vector ---
+    # -------------------------
+    # clusters
+    # -------------------------
     if is_anndata:
         if cluster_col is None:
-            for cand in ("leiden", "louvain", "clusters", "cluster"):
-                if cand in getattr(obj, "obs", pd.DataFrame()).columns:
+            for cand in ("leiden", "louvain", "Clusters", "clusters", "cluster"):
+                if cand in obj.obs.columns:
                     cluster_col = cand
                     break
         if cluster_col is None or cluster_col not in obj.obs.columns:
-            raise KeyError("Cluster column not found. Provide cluster_col (e.g. 'leiden').")
+            raise KeyError("Cluster column not found. Provide cluster_col.")
         clusters = obj.obs[cluster_col].astype(str).to_numpy()
     else:
         clusters = np.asarray(obj.protein.get_labels()).astype(str)
 
-    # --- labels vector ---
+    # -------------------------
+    # labels
+    # -------------------------
     if is_anndata:
-        if label_col not in obj.obs.columns:
-            raise KeyError(f"'{label_col}' not in adata.obs")
-        labels = obj.obs[label_col]
+        if label_in not in obj.obs.columns:
+            raise KeyError(f"'{label_in}' not in adata.obs")
+        labels = obj.obs[label_in]
         was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
-        labels_s = labels.astype(str)
+        labels_arr = labels.to_numpy(dtype=object)
     else:
-        if label_col not in obj.protein.row_attrs:
-            raise KeyError(f"'{label_col}' not in Sample.protein.row_attrs")
-        labels_arr = np.asarray(obj.protein.row_attrs[label_col])
-        labels_s = pd.Series(labels_arr.astype(str))
+        if label_in not in obj.protein.row_attrs:
+            raise KeyError(f"'{label_in}' not in Sample.protein.row_attrs")
+        labels_arr = np.asarray(obj.protein.row_attrs[label_in], dtype=object)
         was_cat = False
 
-    df = pd.DataFrame({"cluster": clusters, "label": labels_s.values})
-    counts = df.groupby(["cluster", "label"]).size().rename("count").reset_index()
-    totals = df.groupby("cluster").size().rename("total").reset_index()
-    freq = counts.merge(totals, on="cluster", how="left")
-    freq["frequency"] = freq["count"] / freq["total"].replace(0, np.nan)
+    # -------------------------
+    # choose output column
+    # -------------------------
+    target_col = label_out or label_in
+    updated = labels_arr.copy()
 
-    top = freq.loc[freq.groupby("cluster")["frequency"].idxmax(), ["cluster", "label", "frequency"]]
-    mixed_clusters = top.loc[top["frequency"] < float(min_frequency_threshold), "cluster"].astype(str).tolist()
+    # -------------------------
+    # compute mixed clusters
+    # -------------------------
+    mixed_clusters = set()
+
+    for cl in pd.unique(clusters):
+        idx = np.where(clusters == cl)[0]
+        labs = updated[idx]
+        labs_valid = labs[pd.notna(labs)]
+
+        if labs_valid.size == 0:
+            mixed_clusters.add(str(cl))
+            continue
+
+        _, cnt = np.unique(labs_valid.astype(str), return_counts=True)
+        top_freq = float(cnt.max() / cnt.sum())
+
+        if top_freq < float(min_frequency_threshold):
+            mixed_clusters.add(str(cl))
 
     if not mixed_clusters:
         return obj
 
+    # -------------------------
+    # apply Mixed label
+    # -------------------------
     mixed_mask = pd.Series(clusters).isin(mixed_clusters).to_numpy()
-    updated = labels_s.where(~mixed_mask, other=mixed_label)
+    updated[mixed_mask] = mixed_label
 
     if is_anndata:
         if was_cat:
-            cats = pd.Index(obj.obs[label_col].cat.categories).astype(str)
+            cats = pd.Index(obj.obs[label_in].cat.categories).astype(str)
             if mixed_label not in cats:
                 cats = cats.append(pd.Index([mixed_label]))
-            obj.obs[label_col] = pd.Categorical(updated, categories=cats)
+            obj.obs[target_col] = pd.Categorical(updated.astype(str), categories=cats)
         else:
-            obj.obs[label_col] = updated
-        return obj
-
-    obj.protein.row_attrs[label_col] = np.asarray(updated.values, dtype=object)
-    return obj
-
-def refine_labels_by_knn_consensus(
-    obj: Union["AnnData", Any],
-    label_col: str = "Averaged.Detailed.Celltype",
-    embedding_key: str = "X_umap",
-    *,
-    k_neighbors: int = 30,
-    min_neighbor_frac: float = 0.70,
-    max_self_frac: float = 0.30,
-    outlier_z: float = 2.0,
-    min_label_size: int = 30,
-    per_label_cap: float = 0.10,
-    global_cap: float = 0.05,
-    out_col: Optional[str] = None,
-    debug_cols: bool = True,
-):
-    """Safer relabeling via local KNN consensus + outlier checks."""
-    is_anndata = isinstance(obj, AnnData)
-    is_sample = _is_mosaic_sample(obj)
-    if not (is_anndata or is_sample):
-        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
-
-    out_col = out_col or f"{label_col}_refined_consensus"
-
-    if is_anndata:
-        if embedding_key not in obj.obsm:
-            raise KeyError(f"Embedding '{embedding_key}' not found in adata.obsm")
-        X = np.asarray(obj.obsm[embedding_key])
-        if label_col not in obj.obs.columns:
-            raise KeyError(f"'{label_col}' not in adata.obs")
-        labels = obj.obs[label_col]
-        was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
-        labels_s = labels.astype(str)
-        idx_like = obj.obs_names
+            obj.obs[target_col] = updated
     else:
-        if "umap" not in obj.protein.row_attrs:
-            raise KeyError("Expected 'umap' in Sample.protein.row_attrs")
-        X = np.asarray(obj.protein.row_attrs["umap"])
-        if X.ndim != 2 or X.shape[1] < 2:
-            raise ValueError("'umap' must be 2D with ≥2 columns")
-        if label_col not in obj.protein.row_attrs:
-            raise KeyError(f"'{label_col}' not in Sample.protein.row_attrs")
-        labels_s = pd.Series(np.asarray(obj.protein.row_attrs[label_col]).astype(str))
-        was_cat = False
-        idx_like = pd.Index(range(X.shape[0]))
-
-    n = X.shape[0]
-    k = max(2, min(int(k_neighbors), n - 1))
-
-    counts = labels_s.value_counts()
-    frequent = set(counts[counts >= int(min_label_size)].index)
-
-    # robust z-score to centroid within label
-    z = np.full(n, np.nan, dtype=float)
-    for lab, idx_lab in labels_s.groupby(labels_s).groups.items():
-        idx_arr = np.fromiter(idx_lab, dtype=int)
-        if idx_arr.size < 3:
-            continue
-        mu = X[idx_arr].mean(axis=0)
-        d = np.linalg.norm(X[idx_arr] - mu, axis=1)
-        med = np.median(d)
-        mad = np.median(np.abs(d - med)) + 1e-12
-        z_vals = (d - med) / (1.4826 * mad)
-        z[idx_arr] = z_vals
-
-    nn = NearestNeighbors(n_neighbors=k + 1, metric="euclidean")
-    nn.fit(X)
-    _, neigh = nn.kneighbors(X, return_distance=True)
-    neigh = neigh[:, 1:][:, :k]
-
-    neigh_labels = labels_s.iloc[neigh.reshape(-1)].to_numpy().reshape(n, -1)
-
-    top_label = np.empty(n, dtype=object)
-    top_frac = np.zeros(n, dtype=float)
-    self_frac = np.zeros(n, dtype=float)
-
-    for i in range(n):
-        vals, ct = np.unique(neigh_labels[i], return_counts=True)
-        order = np.argsort(-ct)
-        vals, ct = vals[order], ct[order]
-        top_label[i] = vals[0]
-        top_frac[i] = ct[0] / float(neigh_labels.shape[1])
-        cur = labels_s.iloc[i]
-        self_ct = ct[vals == cur].sum() if np.any(vals == cur) else 0
-        self_frac[i] = self_ct / float(neigh_labels.shape[1])
-
-    margin = top_frac - self_frac
-    cur_labels = labels_s.to_numpy()
-    candidate = top_label
-
-    flip_mask = (
-        (candidate != cur_labels) &
-        (top_frac >= float(min_neighbor_frac)) &
-        ((self_frac <= float(max_self_frac)) | (z > float(outlier_z))) &
-        (np.isin(candidate, list(frequent)))
-    )
-
-    to_flip_idx = np.where(flip_mask)[0]
-    if to_flip_idx.size:
-        to_flip_idx = to_flip_idx[np.argsort(-margin[to_flip_idx])]
-
-        final_idx = []
-        per_src_used: Dict[str, int] = {}
-        per_src_cap: Dict[str, int] = {
-            lab: int(np.floor(c * float(per_label_cap))) for lab, c in counts.items()
-        }
-
-        for i in to_flip_idx:
-            src = cur_labels[i]
-            if per_src_cap.get(src, 0) <= 0:
-                continue
-            used = per_src_used.get(src, 0)
-            if used < per_src_cap[src]:
-                per_src_used[src] = used + 1
-                final_idx.append(int(i))
-
-        gcap = int(np.floor(n * float(global_cap)))
-        if len(final_idx) > gcap:
-            final_idx = final_idx[:gcap]
-    else:
-        final_idx = []
-
-    final_idx_arr = np.asarray(final_idx, dtype=int)
-
-    new_labels = labels_s.copy()
-    if final_idx_arr.size:
-        new_labels.iloc[final_idx_arr] = candidate[final_idx_arr]
-
-    if is_anndata:
-        if was_cat:
-            cats = pd.Index(obj.obs[label_col].cat.categories).astype(str)
-            new_unique = pd.Index(pd.unique(new_labels.astype(str)))
-            extra = new_unique.difference(cats)
-            cats = cats.append(extra)
-            obj.obs[out_col] = pd.Categorical(new_labels.astype(str), categories=cats)
-        else:
-            obj.obs[out_col] = new_labels
-
-        if debug_cols:
-            obj.obs[f"{out_col}__knn_top_frac"] = top_frac
-            obj.obs[f"{out_col}__knn_self_frac"] = self_frac
-            obj.obs[f"{out_col}__centroid_robust_z"] = z
-            obj.obs[f"{out_col}__flip"] = False
-            if final_idx_arr.size:
-                obj.obs.loc[idx_like[final_idx_arr], f"{out_col}__flip"] = True
-
-        per_label_changes = {}
-        if final_idx_arr.size:
-            src_series = pd.Series(cur_labels[final_idx_arr])
-            per_label_changes = src_series.value_counts().astype(int).to_dict()
-
-        return int(final_idx_arr.size), obj.obs[out_col], obj, per_label_changes
-
-    # Sample-like
-    obj.protein.row_attrs[out_col] = np.asarray(new_labels.values, dtype=object)
-    if debug_cols:
-        obj.protein.row_attrs[f"{out_col}__knn_top_frac"] = top_frac.astype(float)
-        obj.protein.row_attrs[f"{out_col}__knn_self_frac"] = self_frac.astype(float)
-        obj.protein.row_attrs[f"{out_col}__centroid_robust_z"] = z.astype(float)
-        flip_vec = np.zeros(n, dtype=bool)
-        if final_idx_arr.size:
-            flip_vec[final_idx_arr] = True
-        obj.protein.row_attrs[f"{out_col}__flip"] = flip_vec
+        obj.protein.row_attrs[target_col] = updated
 
     return obj
 
@@ -1629,46 +1495,104 @@ def score_mixed_clusters(
 
 def mark_small_clusters(
     obj: Union["AnnData", Any],
-    label_col: str,
+    label_in: str,
     *,
+    cluster_col: Optional[str] = None,
     min_cells: int = 3,
     small_label: str = "Small",
-):
-    """Relabel clusters with < min_cells counts as 'Small'."""
+    label_out: Optional[str] = None,
+) -> Union["AnnData", Any]:
+    """
+    Relabel clusters with fewer than `min_cells` cells as `small_label`.
+
+    If label_out is provided:
+        - copy label_in -> label_out
+        - apply relabeling to label_out
+    Else:
+        - modify label_in in place
+    """
     is_anndata = isinstance(obj, AnnData)
     is_sample = _is_mosaic_sample(obj)
 
     if not (is_anndata or is_sample):
         raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
 
+    # -------------------------
+    # clusters
+    # -------------------------
     if is_anndata:
-        if label_col not in obj.obs.columns:
-            raise KeyError(f"'{label_col}' not found in adata.obs")
-        labels = obj.obs[label_col]
-        was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
-        labels_s = labels.astype(str)
+        if cluster_col is None:
+            for cand in ("leiden", "louvain", "Clusters", "clusters", "cluster"):
+                if cand in obj.obs.columns:
+                    cluster_col = cand
+                    break
+        if cluster_col is None or cluster_col not in obj.obs.columns:
+            raise KeyError("Cluster column not found. Provide cluster_col.")
+        clusters = obj.obs[cluster_col].astype(str).to_numpy()
+
     else:
-        if label_col not in obj.protein.row_attrs:
-            raise KeyError(f"'{label_col}' not found in Sample.protein.row_attrs")
-        arr = np.asarray(obj.protein.row_attrs[label_col])
-        labels_s = pd.Series(arr.astype(str))
+        # IMPORTANT: use row_attrs[cluster_col] if provided
+        if cluster_col is not None:
+            if cluster_col not in obj.protein.row_attrs:
+                raise KeyError(f"'{cluster_col}' not found in sample.protein.row_attrs")
+            clusters = np.asarray(obj.protein.row_attrs[cluster_col], dtype=object).astype(str)
+        else:
+            # fallback only if cluster_col not provided
+            clusters = np.asarray(obj.protein.get_labels(), dtype=object).astype(str)
+
+    # -------------------------
+    # labels
+    # -------------------------
+    if is_anndata:
+        if label_in not in obj.obs.columns:
+            raise KeyError(f"'{label_in}' not found in adata.obs")
+        labels = obj.obs[label_in]
+        was_cat = isinstance(labels.dtype, pd.CategoricalDtype)
+        labels_arr = labels.to_numpy(dtype=object)
+    else:
+        if label_in not in obj.protein.row_attrs:
+            raise KeyError(f"'{label_in}' not in Sample.protein.row_attrs")
+        labels_arr = np.asarray(obj.protein.row_attrs[label_in], dtype=object)
         was_cat = False
 
-    counts = labels_s.value_counts()
-    small = counts[counts < int(min_cells)].index
-    updated = labels_s.replace(dict.fromkeys(small, small_label))
+    # -------------------------
+    # output column
+    # -------------------------
+    target_col = label_out or label_in
+    updated = labels_arr.copy()
 
-    if is_anndata:
-        if was_cat:
-            cats = pd.Index(obj.obs[label_col].cat.categories).astype(str)
-            if small_label not in cats:
-                cats = cats.append(pd.Index([small_label]))
-            obj.obs[label_col] = pd.Categorical(updated.astype(str), categories=cats)
-        else:
-            obj.obs[label_col] = updated
+    # -------------------------
+    # identify small clusters
+    # -------------------------
+    cluster_sizes = pd.Series(clusters).value_counts()
+    small_clusters = cluster_sizes[cluster_sizes < int(min_cells)].index.astype(str)
+
+    if len(small_clusters) == 0:
+        # still write label_out copy if requested
+        if label_out is not None:
+            if is_anndata:
+                obj.obs[target_col] = updated
+            else:
+                obj.protein.row_attrs[target_col] = updated
         return obj
 
-    obj.protein.row_attrs[label_col] = np.asarray(updated.values, dtype=object)
+    small_mask = pd.Series(clusters).isin(small_clusters).to_numpy()
+    updated[small_mask] = small_label
+
+    # -------------------------
+    # write back
+    # -------------------------
+    if is_anndata:
+        if was_cat:
+            cats = pd.Index(obj.obs[label_in].cat.categories).astype(str)
+            if small_label not in cats:
+                cats = cats.append(pd.Index([small_label]))
+            obj.obs[target_col] = pd.Categorical(updated.astype(str), categories=cats)
+        else:
+            obj.obs[target_col] = updated
+    else:
+        obj.protein.row_attrs[target_col] = updated
+
     return obj
 
 def _join_obs_cols(adata: AnnData, pending: Mapping[str, np.ndarray]) -> None:

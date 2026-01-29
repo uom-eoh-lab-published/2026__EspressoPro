@@ -77,7 +77,6 @@ from .annotation import (
     annotate_data,
     mark_small_clusters,
     mark_mixed_clusters,
-    refine_labels_by_knn_consensus,
     clear_annotation,
     score_mixed_clusters,
 )
@@ -140,7 +139,6 @@ __all__ = [
     "Normalise_protein_data",
     "Scale_protein_data",
     "mark_small_clusters",
-    "refine_labels_by_knn_consensus",
     "clear_annotation",
     "score_mixed_clusters",
     "mark_mixed_clusters",
