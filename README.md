@@ -13,12 +13,14 @@
 pip install git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git
 ```
 
-**Stable MissionBio Environment:**
+**Create a stable MissionBio Environment:**
 ```bash
 conda create -n mosaic -c missionbio -c conda-forge   python=3.10 missionbio.mosaic-base=3.12.2 python-kaleido -y
 conda activate mosaic
 pip install git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git
 ```
+
+In alternative used the same provided within https://github.com/uom-eoh-lab-published/2026__EspressoPro/blob/main/tutorials/environments/mosaic_2.yml  
 
 ## Quick start
 
