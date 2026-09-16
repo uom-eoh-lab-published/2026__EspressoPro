@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "espressopro"
-version = "0.9"
+version = "1.0.0"
 authors = [{ name = "Kristian Gurashi", email = "kristian.gurashi@gmail.com" }]
 description = "EspressoPro: An Automated Machine Learning Driven Protein Annotator For Tapestri Data"
 readme = "README.md"

@@ -12,9 +12,6 @@ from .model_loading import (
     get_default_data_path,
     download_models,
     ensure_models_available,
-    ATLAS_NAME,
-    DATA_VERSION,
-    DATA_ARCHIVE_NAME,
 )
 
 # ------------------------- prediction / scoring ------------------------
@@ -82,6 +79,7 @@ from .annotation import (
     mark_mixed_clusters,
     clear_annotation,
     score_mixed_clusters,
+    celltype_confidence,
 )
 
 _HAS_ANNOTATE_COUNTS = False
@@ -120,7 +118,7 @@ from .constants import (
     DETAILED_PARENT_MAP,
 )
 
-__version__ = "0.9.0"
+__version__ = "1.0.0"
 
 __all__ = [
     # model_loading
@@ -130,9 +128,6 @@ __all__ = [
     "get_default_data_path",
     "download_models",
     "ensure_models_available",
-    "ATLAS_NAME",
-    "DATA_VERSION",
-    "DATA_ARCHIVE_NAME",
 
     # Annotation
     "voting_annotator",
@@ -146,6 +141,7 @@ __all__ = [
     "clear_annotation",
     "score_mixed_clusters",
     "mark_mixed_clusters",
+    "celltype_confidence",
 
     # MissionBio
     "suggest_cluster_celltype_identity",

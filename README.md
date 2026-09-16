@@ -19,7 +19,7 @@ pip install git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git
 For a specific older version, replace the tag after `@`:
 
 ```bash
-pip install "git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git@v0.9"
+pip install "git+https://github.com/uom-eoh-lab-published/2026__EspressoPro.git@v1.0.0"
 ```
 
 **Create a stable MissionBio Environment:**
@@ -38,8 +38,8 @@ In alternative used the same environment [provided](https://github.com/uom-eoh-l
 import missionbio.mosaic as ms
 import espressopro as ep
 
-ep.download_models(model_data="latest") 
-# or ep.download_models(model_data="260513") to download a specified version
+ep.download_models(model_date="latest") 
+# or ep.download_models(model_date="260720") to download a specified version
 
 # Load and preprocess data
 sample = ms.load("sample.h5")  
@@ -58,7 +58,7 @@ sample.protein.cluster(
     method='graph-community', k=5, random_state=42)  
 
 # Cell type annotation
-sample = ep.generate_predictions(obj=sample) # picks up whatever model version download_models() last fetched
+sample = ep.generate_predictions(obj=sample, model_date="260720") # if model_date is not specified will use the newest installed release
 sample = ep.annotate_data(obj=sample)
 
 # Optional: rename clusters with less than N cells to Small (potential noise)
@@ -126,7 +126,7 @@ sample = ep.add_signature_annotation(
   author  = {Gurashi, Kristian},
   year    = {2026},
   url     = {https://github.com/uom-eoh-lab-published/2026__EspressoPro},
-  version = {0.9}
+  version = {1.0.0}
 }
 ```
 

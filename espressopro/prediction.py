@@ -448,12 +448,20 @@ def audit_feature_overlap(
     base_layer: str = "Normalized_reads",
     show: int = 20,
     write_dir: Optional[Union[str, Path]] = None,
+    model_date: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Inspect feature-name overlap between the query object and every OvR head / multiclass bundle."""
+    """
+    Inspect feature-name overlap between the query object and every OvR head / multiclass bundle.
+
+    model_date : str, optional
+        Which dated model release to download if models are not already present
+        (only used when models_path/data_path are not explicitly given),
+        e.g. "260720" (YYMMDD). If omitted, the newest installed dated model is used.
+    """
     if models_path is None:
-        models_path = str(get_default_models_path())
+        models_path = str(get_default_models_path(model_date=model_date))
     if data_path is None:
-        data_path = str(get_default_data_path())
+        data_path = str(get_default_data_path(model_date=model_date))
     models = load_models(models_path)
     models_path = Path(models_path)
     data_path = Path(data_path)
@@ -646,6 +654,7 @@ def generate_predictions(
     average_consensus_score_threshold: float = 0.3,
     use_atlases: Optional[Union[str, Sequence[str]]] = None,
     apply_exclusions: Optional[bool] = True,
+    model_date: Optional[str] = None,
 ) -> Union["AnnData", Any]:
     """
     Predict probabilities with optional scaling; write per-atlas probabilities.
@@ -680,6 +689,11 @@ def generate_predictions(
         Restrict to specific atlases
     apply_exclusions : bool, default=True
         Apply atlas exclusions for problematic label/atlas combinations
+    model_date : str, optional
+        Which dated model release to download if models are not already present
+        (only used when models_path/data_path are not explicitly given),
+        e.g. "260720" (YYMMDD). If omitted, the newest installed dated model is used. Can also
+        be set via the $ESPRESSOPRO_MODEL_DATE environment variable.
     
     Returns
     -------
@@ -701,15 +715,15 @@ def generate_predictions(
         Averaged.Consensus.{Depth}.conf
     """
     if models_path is None:
-        models_path = str(get_default_models_path())
+        models_path = str(get_default_models_path(model_date=model_date))
         print(f"[generate_predictions] Using default models path: {models_path}")
     if data_path is None:
-        data_path = str(get_default_data_path())
+        data_path = str(get_default_data_path(model_date=model_date))
         print(f"[generate_predictions] Using default data path: {data_path}")
 
     print("[generate_predictions] Ensuring models are available...")
     try:
-        ensure_models_available()
+        ensure_models_available(model_date=model_date)
     except Exception as e:
         print(f"[generate_predictions] Warning: Could not ensure models available: {e}")
 
@@ -1280,51 +1294,58 @@ def add_best_localised_tracks(
 # -------------------- atlas exclusions --------------------
 
 EXCLUDE_ATLAS: Dict[str, Dict[str, set]] = {
+    "Broad": {
+        "Immature": {"Zhang", "Luecken"},
+        "Mature": {"Zhang", "Luecken"},
+    },
     "Simplified": {
-        "CD4_T": {"Hao", "Triana"},
-        "CD8_T": {"Hao"},
+        "CD4_T": {"Luecken", "Zhang", "Triana"},
+        "CD8_T": {"Luecken", "Hao"},
         "Other_T": {"Luecken", "Zhang"},
-        "Erythroid": {"Triana", "Luecken", "Hao"},
-        "HSPC": {"Zhang", "Luecken", "Triana"},
+        "EoBaMa": {"Zhang"},
+        "Erythroid": {"Zhang"},
+        "HSPC": {"Zhang", "Luecken"},
+        "Megakaryocyte": {"Zhang"},
         "Monocyte": {"Hao"},
-        "Myeloid": {"Zhang", "Luecken", "Hao"},
-        "NK": {"Hao"},
-        "cDC": {"Zhang", "Triana", "Hao"},
-        "B": {"Triana", "Hao"},
-        "Plasma": {"Zhang", "Triana", "Hao"},
+        "Myeloid": {"Triana"},
+        "NK": {"Zhang", "Hao"},
+        "cDC": {"Hao", "Zhang", "Triana"},
+        "pDC": {"Luecken", "Triana"},
+        "B": {"Zhang", "Triana", "Luecken"},
+        "Plasma": {"Zhang", "Triana"},
     },
     "Detailed": {
-        "B_Memory": {"Zhang", "Luecken"},
+        "B_Memory": {""},
         "B_Naive": {"Zhang", "Luecken"},
-        "CD14_Mono": {""},
-        "CD16_Mono": {"Triana"},
-        "CD4_CTL": {""},
-        "CD4_T_Memory": {"Triana", "Hao"},
-        "CD4_T_Naive":  {"Triana", "Hao"},
-        "CD8_T_Memory": {"Triana", "Hao"},
-        "CD8_T_Naive": {"Triana", "Hao"},
+        "CD14_Mono": {"Hao", "Triana", "Luecken"},
+        "CD16_Mono": {"Hao"},
+        "CD4_CTL": {},
+        "CD4_T_Memory": {"Zhang"},
+        "CD4_T_Naive":  {"Triana"},
+        "CD8_T_Memory": {"Triana"},
+        "CD8_T_Naive": {"Triana"},
         "EoBaMaP": {"Zhang", "Luecken", "Hao"},
-        "ErP": {"Luecken", "Hao"},
+        "ErP": {"Luecken"},
         "Erythroblast": {"Hao", "Triana", "Zhang"},
         "GMP": {"Zhang", "Luecken", "Hao"},
         "GdT": {"Zhang", "Luecken"},
         "HSC_MPP": {"Zhang", "Luecken"},
-        "Immature_B": {"Luecken"},
+        "Immature_B": {"Luecken", "Zhang"},
         "LMPP": {"Zhang", "Luecken", "Hao"},
-        "MAIT": {"Luecken", "Triana", "Zhang"},
+        "MAIT": {"Luecken", "Triana", "Hao"},
         "MEP": {"Hao", "Luecken", "Zhang"},
         "MkP": {"Hao", "Luecken", "Zhang"},
-        "Myeloid_precursor": {"Hao", "Luecken"},
-        "NK_CD56_bright": {"Zhang", "Luecken"},
-        "NK_CD56_dim": {"Zhang", "Luecken", "Hao"},
+        "Myeloid_precursor": {"Triana"},
+        "NK_CD56_bright": {"Hao"},
+        "NK_CD56_dim": {"Luecken", "Hao"},
         "Plasma": {"Zhang", "Triana"},
-        "Pre-B": {"Hao", "Luecken", "Zhang"},
+        "Pre-B": {"Hao", "Luecken"},
         "Pre-Pro-B": {"Hao", "Luecken", "Triana"},
-        "Pro-B": {"Hao", "Zhang", "Luecken"},
+        "Pro-B": {"Hao"},
         "Treg": {""},
-        "cDC1": {"Luecken", "Zhang", "Triana"},
-        "cDC2": {"Luecken", "Zhang", "Triana"},
-        "pDC": {"Zhang", "Luecken"},
+        "cDC1": {"Hao"},
+        "cDC2": {"Hao", "Triana"},
+        "pDC": {"Hao", "Luecken"},
     },
 }
 

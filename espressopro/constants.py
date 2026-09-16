@@ -9,11 +9,11 @@ _REF_DETAILED   = ("Averaged.Detailed",)
 
 # Detailed labels (suffixes must match predscore columns)
 _DETAILED_LABELS = [
-    "CD14_Mono", "CD16_Mono", "cDC2", "ILC", "Macrophage", "MkP",
-    "HSC_MPP", "MEP", "ErP", "GMP", "Pre-Pro-B", "EoBaMaP", "Plasma",
+    "CD14_Mono", "CD16_Mono", "cDC2", "MkP",
+    "HSC_MPP", "MEP", "ErP", "GMP", "EoBaMaP", "Plasma",
     "B_Naive", "B_Memory", "Immature_B", "CD4_T_Naive", "CD4_T_Memory", "CD4_CTL",
     "Treg", "CD8_T_Naive", "CD8_T_Memory", "MAIT", "NK_CD56_dim", "NK_CD56_bright",
-    "Erythroblast", "Stroma", "pDC", "GdT", "Myeloid_precursor",
+    "Erythroblast", "pDC", "GdT", "Myeloid_precursor",
     "Pre-B", "Pro-B", "LMPP", "cDC1"
 ]
 
@@ -22,7 +22,7 @@ SIMPLIFIED_CLASSES = {
     lbl: [f"{ref}.{lbl}.predscore" for ref in _REF_SIMPLIFIED]
     for lbl in (
         "NK", "HSPC", "Erythroid", "pDC", "Monocyte", "Myeloid",
-        "CD4_T", "CD8_T", "B", "Other_T", "Plasma", "cDC"
+        "CD4_T", "CD8_T", "B", "Other_T", "Plasma", "cDC", "Megakaryocyte", "EoBaMa"
     )
 }
 
@@ -43,12 +43,8 @@ DETAILED_PARENT_MAP = {
     "HSPC": [
         "Averaged.Detailed.HSC_MPP.predscore",
         "Averaged.Detailed.GMP.predscore",
-        "Averaged.Detailed.Pre-Pro-B.predscore",
-        "Averaged.Detailed.MkP.predscore",
         "Averaged.Detailed.LMPP.predscore",
-        "Averaged.Detailed.EoBaMaP.predscore",
         "Averaged.Detailed.MEP.predscore",
-        "Averaged.Detailed.Pro-B.predscore",
     ],
     "Erythroid": [
         "Averaged.Detailed.MEP.predscore",
@@ -63,11 +59,11 @@ DETAILED_PARENT_MAP = {
     "cDC": ["Averaged.Detailed.cDC1.predscore",
                 "Averaged.Detailed.cDC2.predscore",
     ],
-    "Myeloid": ["Averaged.Detailed.Myeloid_precursor.predscore"
+    "Myeloid": ["Averaged.Detailed.GMP.predscore",
+        "Averaged.Detailed.Myeloid_precursor.predscore"
     ],
     "Other_T": [
-        "Averaged.Detailed.GdT.predscore",
-        "Averaged.Detailed.MAIT.predscore",
+        "Averaged.Detailed.GdT.predscore"
     ],
     "NK": [
         "Averaged.Detailed.NK_CD56_dim.predscore",
@@ -91,9 +87,12 @@ DETAILED_PARENT_MAP = {
         "Averaged.Detailed.Immature_B.predscore",
         "Averaged.Detailed.Pre-B.predscore",
         "Averaged.Detailed.Pro-B.predscore",
-        "Averaged.Detailed.Pre-Pro-B.predscore",
     ],
     "Plasma": ["Averaged.Detailed.Plasma.predscore"],
+    "Megakaryocyte": ["Averaged.Detailed.MkP.predscore"],
+    "EoBaMa": [
+        "Averaged.Detailed.EoBaMaP.predscore",
+    ],
 }
 
 # Mast cell signatures

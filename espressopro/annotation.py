@@ -34,6 +34,9 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 from anndata import AnnData
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_samples
+from sklearn.neighbors import NearestNeighbors
 
 from .constants import (
     SIMPLIFIED_CLASSES,
@@ -1179,7 +1182,6 @@ def annotate_data(
     
     return obj
 
-
 def _get_matrix_for_embedding(
     obj: Union[AnnData, Any],
     embedding_key: str = "X_umap",
@@ -1438,6 +1440,138 @@ def score_mixed_clusters(
 
     df["mixed_likelihood"] = w_e * df["mix_from_entropy"].values + w_s * df["mix_from_sil"].values
     return df.sort_values("mixed_likelihood", ascending=False)
+
+
+def celltype_confidence(
+    obj: Union["AnnData", Any],
+    *,
+    celltype_col: str = "Averaged.Detailed.Celltype",
+    score_col: str = "Averaged.Detailed.Celltype.TopScore",
+    cluster_col: Optional[str] = None,
+    embedding_key: str = "umap",
+    n_pca: int = 20,
+    k: int = 15,
+    weights: Optional[Dict[str, float]] = None,
+) -> pd.DataFrame:
+    """
+    Per-celltype (or per-cluster) confidence score, combining:
+      - size:       saturating log-scaled cell count
+      - proximity:  kNN label purity in embedding space
+      - max_score:  mean of an existing per-cell confidence/predscore column
+                     (e.g. the TopScore column written by voting_annotator)
+      - silhouette: per-cell silhouette vs other groups, rescaled to [0,1]
+
+    Works on both AnnData (obs columns) and missionbio.mosaic Sample-like
+    objects (protein.row_attrs), matching the dual-backend pattern used
+    throughout this module.
+
+    Parameters
+    ----------
+    celltype_col : column holding the cell type call.
+    score_col : column holding a per-cell confidence score (e.g.
+        "<level_name>.Celltype.TopScore" written by voting_annotator).
+    cluster_col : optional independent clustering column (e.g. "Clusters")
+        to group by instead of celltype_col. Grouping by an independent
+        cluster assignment is usually more informative than grouping by the
+        celltype call itself, since it decouples "is this cluster coherent"
+        from "did we label it correctly".
+    embedding_key : passed to _get_matrix_for_embedding (umap if present,
+        else PCA on Scaled_reads).
+    weights : optional dict with keys "size_score", "proximity_score",
+        "max_predscore", "silhouette_score" for a weighted-sum combination.
+        If None, uses the geometric mean of all four (any weak axis pulls
+        confidence down).
+
+    Returns
+    -------
+    DataFrame indexed by group (celltype or cluster), sorted by descending
+    confidence, with columns: n_cells, size_score, proximity_score,
+    max_predscore, silhouette_score, confidence.
+    """
+    is_anndata = isinstance(obj, AnnData)
+    is_sample = _is_mosaic_sample(obj)
+    if not (is_anndata or is_sample):
+        raise TypeError("Expected AnnData or a missionbio.mosaic Sample-like object")
+
+    if is_anndata:
+        if celltype_col not in obj.obs.columns:
+            raise KeyError(f"'{celltype_col}' not found in adata.obs")
+        if score_col not in obj.obs.columns:
+            raise KeyError(f"'{score_col}' not found in adata.obs")
+        labels = obj.obs[celltype_col].astype(str).to_numpy()
+        scores = obj.obs[score_col].to_numpy(dtype=float)
+        group_col = cluster_col or celltype_col
+        if group_col not in obj.obs.columns:
+            raise KeyError(f"'{group_col}' not found in adata.obs")
+        groups = obj.obs[group_col].astype(str).to_numpy()
+    else:
+        ra = obj.protein.row_attrs
+        if celltype_col not in ra:
+            raise KeyError(f"'{celltype_col}' not found in sample.protein.row_attrs")
+        if score_col not in ra:
+            raise KeyError(f"'{score_col}' not found in sample.protein.row_attrs")
+        labels = np.asarray(ra[celltype_col]).astype(str)
+        scores = np.asarray(ra[score_col], dtype=float)
+        group_col = cluster_col or celltype_col
+        if group_col not in ra:
+            raise KeyError(f"'{group_col}' not found in sample.protein.row_attrs")
+        groups = np.asarray(ra[group_col]).astype(str)
+
+    n = len(groups)
+    if len(labels) != n or len(scores) != n:
+        raise ValueError("celltype/score/group columns must all have the same length")
+
+    X = _get_matrix_for_embedding(obj, embedding_key=embedding_key, n_pca=n_pca)
+    if X.shape[0] != n:
+        raise ValueError("Embedding length does not match celltype/group length")
+
+    # --- 1. size: saturating log scale ---
+    counts = pd.Series(groups).value_counts()
+    ref_n = counts.median()
+    size_score = np.minimum(1.0, np.log1p(counts) / np.log1p(ref_n))
+
+    # --- 2. proximity: kNN label purity ---
+    kk = min(k, n - 1)
+    if kk < 1:
+        purity_score = pd.Series(0.0, index=counts.index)
+    else:
+        nn = NearestNeighbors(n_neighbors=kk + 1).fit(X)
+        _, idx = nn.kneighbors(X)
+        neighbor_groups = groups[idx[:, 1:]]
+        same = (neighbor_groups == groups[:, None]).mean(axis=1)
+        purity_score = pd.Series(same, index=range(n)).groupby(groups).mean()
+
+    # --- 3. mean of the provided per-cell score column ---
+    score_score = pd.Series(scores, index=range(n)).groupby(groups).mean()
+
+    # --- 4. silhouette, rescaled from [-1, 1] to [0, 1] ---
+    uniq = np.unique(groups)
+    if uniq.size >= 2 and all((groups == u).sum() >= 2 for u in uniq):
+        try:
+            sil = silhouette_samples(X, groups)
+        except Exception:
+            sil = np.zeros(n)
+    else:
+        sil = np.zeros(n)
+    sil_score = (pd.Series(sil, index=range(n)).groupby(groups).mean() + 1) / 2
+
+    df = pd.DataFrame({
+        "n_cells": counts,
+        "size_score": size_score,
+        "proximity_score": purity_score,
+        "max_predscore": score_score,
+        "silhouette_score": sil_score,
+    })
+
+    cols = ["size_score", "proximity_score", "max_predscore", "silhouette_score"]
+    if weights is None:
+        df["confidence"] = df[cols].prod(axis=1) ** (1.0 / len(cols))
+    else:
+        w = pd.Series(weights)
+        df["confidence"] = df[cols].mul(w).sum(axis=1)
+
+    return df.sort_values("confidence", ascending=False)
+
 
 def mark_small_clusters(
     obj: Union["AnnData", Any],

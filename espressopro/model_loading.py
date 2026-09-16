@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 import shutil
 import tarfile
@@ -11,6 +13,7 @@ import tempfile
 import urllib.request
 import zipfile
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence, Union
 
@@ -18,86 +21,172 @@ import joblib
 import pandas as pd
 
 ATLAS_NAME = "TotalSeqD_Heme_Oncology_CAT399906"
-DATA_VERSION = "260513"  # fallback version used when model_data is not given
-DATA_ARCHIVE_NAME = f"{ATLAS_NAME}_{DATA_VERSION}.tar.xz"
-HF_DATA_REPO = "https://huggingface.co/EspressoKris/EspressoPro/resolve/main"
-DEFAULT_MODELS_URL = f"{HF_DATA_REPO}/{DATA_ARCHIVE_NAME}"
 MODELS_SUBPATH = Path("Pre_trained_models") / ATLAS_NAME
+MODELS_BASE_URL = "https://huggingface.co/EspressoKris/EspressoPro/resolve/main"
+
+# Dated model releases use a six-digit YYMMDD suffix, for example:
+# TotalSeqD_Heme_Oncology_CAT399906_260720.tar.xz
+_MODEL_DATE_RE = re.compile(r"^\d{6}$")
+_DATED_ATLAS_RE = re.compile(rf"^{re.escape(ATLAS_NAME)}_(\d{{6}})$")
+_MODEL_DATE_MARKER_NAME = ".model_date"
 
 
-def _resolve_data_archive_name(model_data: Optional[str]) -> str:
-    """
-    Map a ``model_data`` selector to the archive file name on Hugging Face.
+def _normalize_model_date(model_date: Optional[str]) -> Optional[str]:
+    """Validate and normalize a model release date in YYMMDD format."""
+    if model_date is None:
+        return None
 
-    ``model_data`` may be:
+    value = str(model_date).strip()
+    if not value:
+        return None
+    if not _MODEL_DATE_RE.fullmatch(value):
+        raise ValueError(
+            f"model_date must use six-digit YYMMDD format, e.g. '260720'; got {model_date!r}"
+        )
 
-      - ``None`` (default): use the fallback pinned ``DATA_VERSION``.
-      - ``"latest"``: fetch the archive tagged as the latest release.
-      - a dated version string, e.g. ``"260714"``: fetch that specific
-        release.
-    """
-    version = model_data or DATA_VERSION
-    return f"{ATLAS_NAME}_{version}.tar.xz"
+    yy, mm, dd = int(value[:2]), int(value[2:4]), int(value[4:6])
+    try:
+        date(2000 + yy, mm, dd)
+    except ValueError as exc:
+        raise ValueError(f"Invalid model_date {value!r}: {exc}") from exc
+
+    return value
+
+
+def _atlas_dir_name(model_date: Optional[str]) -> str:
+    normalized = _normalize_model_date(model_date)
+    return ATLAS_NAME if normalized is None else f"{ATLAS_NAME}_{normalized}"
+
+
+def _model_date_from_name(name: Union[str, Path]) -> Optional[str]:
+    """Extract a YYMMDD model date from an archive or atlas-directory name."""
+    base = Path(str(name)).name
+    for suffix in (".tar.xz", ".tar.gz", ".tgz", ".zip", ".tar"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    match = _DATED_ATLAS_RE.fullmatch(base)
+    return _normalize_model_date(match.group(1)) if match else None
+
+
+def _archive_filename(model_date: Optional[str]) -> str:
+    """Build the archive filename for an optional YYMMDD release date."""
+    return f"{_atlas_dir_name(model_date)}.tar.xz"
+
+
+def _default_url_for_date(model_date: Optional[str]) -> str:
+    return f"{MODELS_BASE_URL}/{_archive_filename(model_date)}"
+
+
+_HF_REPO_ID = "EspressoKris/EspressoPro"
+_HF_API_URL = f"https://huggingface.co/api/models/{_HF_REPO_ID}"
+_LATEST_SENTINEL = "latest"
+
+
+def _is_latest_sentinel(model_date: Optional[str]) -> bool:
+    return isinstance(model_date, str) and model_date.strip().lower() == _LATEST_SENTINEL
+
+
+def _list_remote_model_dates() -> list[str]:
+    """Query the Hugging Face repo listing for all dated release archives."""
+    req = urllib.request.Request(_HF_API_URL, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            info = json.load(resp)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not reach Hugging Face to resolve model_date='latest' "
+            f"({_HF_API_URL}): {exc}"
+        ) from exc
+
+    filenames = [
+        s.get("rfilename", "") for s in info.get("siblings", []) if isinstance(s, dict)
+    ]
+    dates = sorted({d for d in (_model_date_from_name(f) for f in filenames) if d})
+    return dates
+
+
+def _resolve_latest_model_date() -> str:
+    """Return the newest dated release currently published on Hugging Face."""
+    dates = _list_remote_model_dates()
+    if not dates:
+        raise RuntimeError(
+            "model_date='latest' was requested but no dated releases "
+            f"(<{ATLAS_NAME}>_YYMMDD.tar.xz) were found in {_HF_REPO_ID}."
+        )
+    return dates[-1]
 
 
 def download_models(
     *,
-    model_data: Optional[str] = None,
     force: bool = False,
+    model_date: Optional[str] = None,
     url: Optional[str] = None,
     local_archive: Optional[str] = None,
 ) -> Path:
     """
-    Download and extract pre-trained models.
+    Download and extract a pre-trained model release.
+
+    Dated releases are stored side by side, so downloading one release never
+    overwrites another release. For example:
+
+        data/Pre_trained_models/TotalSeqD_Heme_Oncology_CAT399906_260513/
+        data/Pre_trained_models/TotalSeqD_Heme_Oncology_CAT399906_260720/
 
     Parameters
     ----------
-    model_data
-        Which data release to fetch from the EspressoPro Hugging Face
-        repository (https://huggingface.co/EspressoKris/EspressoPro):
-
-            ep.download_models(model_data="latest")
-            # or ep.download_models(model_data="260714") to download a specified version
-
-        Defaults to the pinned fallback release
-        (``TotalSeqD_Heme_Oncology_CAT399906_260513.tar.xz``) when omitted.
-        Ignored if ``url`` or ``local_archive`` is given.
+    force
+        Re-download/re-extract the requested release even when it is present.
+    model_date
+        Six-digit release date in YYMMDD format, e.g. ``"260720"``.
+        Pass ``"latest"`` to auto-resolve and download the newest dated
+        release currently published on Hugging Face.
+        When omitted, the unversioned archive ``<ATLAS_NAME>.tar.xz`` is used.
     url
-        Explicit archive URL to download instead of resolving one from
-        ``model_data``. Takes precedence over ``model_data``.
-
-    Models are expected to resolve to one of the following layouts:
-
-        <pkg>/data/Pre_trained_models/<ATLAS_NAME>/
-        <pkg>/data/<ATLAS_NAME>/
-
-    The atlas root should contain:
-
-        <ATLAS_NAME>/
-            Hao/Release/Broad/Models/Multiclass_models.joblib
-            Hao/Release/Simplified/Models/Multiclass_models.joblib
-            Hao/Release/Detailed/Models/Multiclass_models.joblib
-            ...
+        Explicit archive URL. If ``model_date`` is omitted and the URL filename
+        contains a YYMMDD suffix, that date is inferred automatically.
+    local_archive
+        Path to an already-downloaded archive. Its YYMMDD suffix is inferred
+        when ``model_date`` is omitted.
 
     Returns
     -------
     Path
         The package data directory.
     """
+    if _is_latest_sentinel(model_date):
+        resolved = _resolve_latest_model_date()
+        print(f"[download_models] Resolved model_date='latest' -> {resolved}")
+        model_date = resolved
 
     script_dir = Path(__file__).parent.resolve()
     data_dir = script_dir / "data"
-    models_root = data_dir / MODELS_SUBPATH
 
-    if url is None and local_archive is None:
-        url = f"{HF_DATA_REPO}/{_resolve_data_archive_name(model_data)}"
+    inferred_date: Optional[str] = None
+    if model_date is None:
+        if local_archive:
+            inferred_date = _model_date_from_name(local_archive)
+        elif url:
+            inferred_date = _model_date_from_name(url)
+
+    normalized_date = _normalize_model_date(model_date) or inferred_date
+    target_name = _atlas_dir_name(normalized_date)
+    models_root = data_dir / "Pre_trained_models" / target_name
+    marker_path = models_root / _MODEL_DATE_MARKER_NAME
+    release_label = normalized_date or "unversioned"
 
     if not force and any_existing_multiclass_bundle(models_root):
-        print("[download_models] Models already present.")
+        print(f"[download_models] Models already present (release: {release_label}).")
         return data_dir
+
+    if url is None:
+        url = _default_url_for_date(normalized_date)
 
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "Pre_trained_models").mkdir(parents=True, exist_ok=True)
+
+    if force and models_root.exists():
+        shutil.rmtree(models_root)
 
     def _safe_extract_tar(tar: tarfile.TarFile, path: Path) -> None:
         base = path.resolve()
@@ -115,66 +204,36 @@ def download_models(
                 raise RuntimeError(f"Blocked path traversal in zip member: {member.filename}")
         zf.extractall(path)
 
-    def _copy_dir(src: Path, dst: Path) -> None:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst, dirs_exist_ok=True)
+    def _looks_like_atlas_root(path: Path) -> bool:
+        return any(
+            (path / atlas / "Release").is_dir()
+            for atlas in ("Hao", "Zhang", "Triana", "Luecken")
+        )
 
-    def _merge_into_data(extracted_root: Path) -> None:
-        """
-        Merge extracted payload into <pkg>/data.
+    def _find_extracted_atlas_root(extracted_root: Path) -> Path:
+        preferred_names = [target_name, ATLAS_NAME]
+        candidates: list[Path] = []
 
-        Supports archives containing any of:
+        for name in preferred_names:
+            candidates.extend(
+                [
+                    extracted_root / "data" / "Pre_trained_models" / name,
+                    extracted_root / "Pre_trained_models" / name,
+                    extracted_root / "data" / name,
+                    extracted_root / name,
+                ]
+            )
 
-          1) data/Pre_trained_models/<ATLAS_NAME>/...
-          2) Pre_trained_models/<ATLAS_NAME>/...
-          3) <ATLAS_NAME>/...
-          4) arbitrary legacy folder layout copied into data/
-        """
-        data_candidates = [
-            p for p in extracted_root.iterdir()
-            if p.is_dir() and p.name.lower() == "data"
-        ]
-        roots = data_candidates or [extracted_root]
+        candidates.append(extracted_root)
+        candidates.extend(p for p in extracted_root.rglob("*") if p.is_dir())
 
-        for root in roots:
-            # Case 1 or 2: root/Pre_trained_models/<ATLAS_NAME>
-            p1 = root / "Pre_trained_models" / ATLAS_NAME
-            if p1.is_dir():
-                _copy_dir(p1, data_dir / "Pre_trained_models" / ATLAS_NAME)
-                continue
-
-            # Case 3: root/<ATLAS_NAME>
-            p2 = root / ATLAS_NAME
-            if p2.is_dir():
-                _copy_dir(p2, data_dir / "Pre_trained_models" / ATLAS_NAME)
-                continue
-
-            # Case 4: archive may itself unpack directly as atlas contents,
-            # but without the atlas folder. Detect by looking for atlas folders.
-            atlas_like = [
-                root / atlas
-                for atlas in ("Hao", "Zhang", "Triana", "Luecken")
-                if (root / atlas / "Release").is_dir()
-            ]
-            if atlas_like:
-                dst = data_dir / "Pre_trained_models" / ATLAS_NAME
-                dst.mkdir(parents=True, exist_ok=True)
-                for child in root.iterdir():
-                    dest = dst / child.name
-                    if child.is_dir():
-                        shutil.copytree(child, dest, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(child, dest)
-                continue
-
-            # Fallback: copy children into data/
-            for child in root.iterdir():
-                dest = data_dir / child.name
-                if child.is_dir():
-                    shutil.copytree(child, dest, dirs_exist_ok=True)
-                else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(child, dest)
+        valid = [p for p in candidates if p.is_dir() and _looks_like_atlas_root(p)]
+        if not valid:
+            raise RuntimeError(
+                "Could not locate an atlas model root in the extracted archive. "
+                "Expected Hao/Zhang/Triana/Luecken release directories."
+            )
+        return min(valid, key=lambda p: len(p.parts))
 
     def _extract_archive(archive_path: Path) -> None:
         print(f"[download_models] Extracting: {archive_path}")
@@ -182,32 +241,40 @@ def download_models(
             out = Path(tmp_dir) / "extract"
             out.mkdir(parents=True, exist_ok=True)
 
-            try:
-                if tarfile.is_tarfile(archive_path):
-                    with tarfile.open(archive_path, "r:*") as tar:
-                        _safe_extract_tar(tar, out)
-                elif zipfile.is_zipfile(archive_path):
-                    with zipfile.ZipFile(archive_path) as zf:
-                        _safe_extract_zip(zf, out)
-                else:
-                    raise RuntimeError("Unknown archive format: not tar or zip.")
-            except Exception as exc:
-                raise RuntimeError(f"Failed to extract archive: {exc}") from exc
+            if tarfile.is_tarfile(archive_path):
+                with tarfile.open(archive_path, "r:*") as tar:
+                    _safe_extract_tar(tar, out)
+            elif zipfile.is_zipfile(archive_path):
+                with zipfile.ZipFile(archive_path) as zf:
+                    _safe_extract_zip(zf, out)
+            else:
+                raise RuntimeError("Unknown archive format: not tar or zip.")
 
-            _merge_into_data(out)
+            source_root = _find_extracted_atlas_root(out)
+            models_root.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source_root, models_root, dirs_exist_ok=True)
+
+        if not any_existing_multiclass_bundle(models_root):
+            raise RuntimeError(
+                f"No Multiclass_models.joblib files were found after extraction into {models_root}"
+            )
+
+        marker_path.write_text(release_label)
 
     if local_archive:
         archive_path = Path(local_archive).expanduser().resolve()
         if not archive_path.exists():
             raise FileNotFoundError(f"Local archive not found: {archive_path}")
         _extract_archive(archive_path)
-
     else:
-        try:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmpfile = Path(tmp_dir) / "models.archive"
-                print(f"[download_models] Downloading pre-trained models from {url} ...")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmpfile = Path(tmp_dir) / "models.archive"
+            print(
+                f"[download_models] Downloading pre-trained models "
+                f"(release: {release_label}) from {url} ..."
+            )
 
+            try:
                 with urllib.request.urlopen(url) as response, open(tmpfile, "wb") as handle:
                     total = getattr(response, "length", None) or 0
                     read = 0
@@ -217,7 +284,6 @@ def download_models(
                         chunk = response.read(block)
                         if not chunk:
                             break
-
                         handle.write(chunk)
                         read += len(chunk)
 
@@ -230,29 +296,17 @@ def download_models(
 
                     if total:
                         sys.stdout.write("\n")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to download model release {release_label!r} from {url}: {exc}"
+                ) from exc
 
-                if not tmpfile.exists() or tmpfile.stat().st_size == 0:
-                    raise RuntimeError("Download produced an empty file.")
+            if not tmpfile.exists() or tmpfile.stat().st_size == 0:
+                raise RuntimeError("Download produced an empty file.")
 
-                _extract_archive(tmpfile)
+            _extract_archive(tmpfile)
 
-        except Exception as exc:
-            print(f"[download_models] Failed to download models: {exc}")
-            print("[download_models] Place the extracted folder at one of:")
-            print(f"  {data_dir / 'Pre_trained_models' / ATLAS_NAME}")
-            print(f"  {data_dir / ATLAS_NAME}")
-            print("Or re-run with a local archive:")
-            print(
-                "  download_models("
-                f"local_archive='/abs/path/{DATA_ARCHIVE_NAME}'"
-                ")"
-            )
-
-    if any_existing_multiclass_bundle(models_root) or any_existing_multiclass_bundle(data_dir / ATLAS_NAME):
-        print(f"[download_models] Models ready under {data_dir}")
-    else:
-        print("[download_models] Models not found after extraction.")
-
+    print(f"[download_models] Models ready: {models_root} (release: {release_label})")
     return data_dir
 
 
@@ -262,225 +316,250 @@ def any_existing_multiclass_bundle(path: Union[str, Path]) -> bool:
     return p.exists() and any(p.rglob("Multiclass_models.joblib"))
 
 
-def _candidate_models_dirs() -> list[Path]:
-    """
-    Likely locations for the atlas root:
-
-        TotalSeqD_Heme_Oncology_CAT399906/
-            Hao/Release/Broad/Models/Multiclass_models.joblib
-            ...
-
-    Supports both:
-
-        <data>/Pre_trained_models/<ATLAS_NAME>
-        <data>/<ATLAS_NAME>
-    """
+def _candidate_data_bases() -> list[Path]:
     here = Path(__file__).parent.resolve()
-
-    pkg_data = here / "data"
-    repo_data = here.parent / "data"
-    repo_Data = here.parent / "Data"
-    home_data = Path.home() / ".espressopro"
-
-    bases = [pkg_data, repo_data, repo_Data, home_data]
-
-    candidates: list[Path] = []
-    for base in bases:
-        candidates.extend(
-            [
-                base / "Pre_trained_models" / ATLAS_NAME,
-                base / ATLAS_NAME,
-            ]
-        )
-
-    return candidates
+    return [
+        here / "data",
+        here.parent / "data",
+        here.parent / "Data",
+        Path.home() / ".espressopro",
+    ]
 
 
-def _resolve_models_root(models_path: Union[str, Path]) -> Path:
+def _models_roots_under(base: Path) -> list[Path]:
+    """Return valid dated and legacy atlas roots directly under a data-like base."""
+    search_parents = [base, base / "Pre_trained_models"]
+    roots: list[Path] = []
+
+    for parent in search_parents:
+        if not parent.is_dir():
+            continue
+
+        legacy = parent / ATLAS_NAME
+        if any_existing_multiclass_bundle(legacy):
+            roots.append(legacy)
+
+        for candidate in parent.glob(f"{ATLAS_NAME}_[0-9][0-9][0-9][0-9][0-9][0-9]"):
+            if candidate.is_dir() and _model_date_from_name(candidate.name):
+                if any_existing_multiclass_bundle(candidate):
+                    roots.append(candidate)
+
+    unique: dict[str, Path] = {}
+    for root in roots:
+        unique[str(root.resolve())] = root.resolve()
+    return list(unique.values())
+
+
+def _select_models_root(
+    roots: Sequence[Path],
+    model_date: Optional[str] = None,
+) -> Optional[Path]:
+    """Select an exact requested release, or the newest installed dated release."""
+    requested = _normalize_model_date(model_date)
+    valid = [Path(root) for root in roots if any_existing_multiclass_bundle(root)]
+
+    if requested is not None:
+        exact = [root for root in valid if _model_date_from_name(root.name) == requested]
+        return exact[0] if exact else None
+
+    dated = [root for root in valid if _model_date_from_name(root.name) is not None]
+    if dated:
+        return max(dated, key=lambda root: _model_date_from_name(root.name) or "")
+
+    legacy = [root for root in valid if root.name == ATLAS_NAME]
+    return legacy[0] if legacy else None
+
+
+def _candidate_models_dirs() -> list[Path]:
+    """Return installed model roots, newest dated release first."""
+    roots: list[Path] = []
+    for base in _candidate_data_bases():
+        roots.extend(_models_roots_under(base))
+
+    unique: dict[str, Path] = {}
+    for root in roots:
+        unique[str(root.resolve())] = root.resolve()
+
+    return sorted(
+        unique.values(),
+        key=lambda root: (
+            _model_date_from_name(root.name) is not None,
+            _model_date_from_name(root.name) or "",
+        ),
+        reverse=True,
+    )
+
+
+def _data_dir_from_models_root(root: Path) -> Path:
+    root = root.resolve()
+    if root.parent.name == "Pre_trained_models":
+        return root.parent.parent
+    return root.parent
+
+
+def _resolve_models_root(
+    models_path: Union[str, Path],
+    *,
+    model_date: Optional[str] = None,
+) -> Path:
     """
-    Resolve models_path to the actual atlas root:
-
-        .../TotalSeqD_Heme_Oncology_CAT399906
-
-    Accepts:
-
-        .../TotalSeqD_Heme_Oncology_CAT399906
-        .../Pre_trained_models
-        .../data
-        .../data/Pre_trained_models/TotalSeqD_Heme_Oncology_CAT399906
+    Resolve a path to an atlas root. When the path contains several dated
+    releases, choose the highest YYMMDD date unless ``model_date`` is given.
     """
     p = Path(models_path).expanduser().resolve()
+    requested = _normalize_model_date(model_date)
 
     if not p.exists():
         raise FileNotFoundError(f"models_path does not exist: {p}")
 
-    # Case 1: already points to the atlas root.
-    if p.name == ATLAS_NAME and any_existing_multiclass_bundle(p):
+    # An explicitly supplied atlas root always wins, provided it matches the
+    # requested date when one was supplied.
+    if any_existing_multiclass_bundle(p) and (
+        p.name == ATLAS_NAME or _model_date_from_name(p.name) is not None
+    ):
+        actual = _model_date_from_name(p.name)
+        if requested is not None and actual != requested:
+            raise FileNotFoundError(
+                f"Requested model_date={requested}, but explicit models_path points to "
+                f"release {actual or 'unversioned'}: {p}"
+            )
         return p
 
-    # Case 2: points to Pre_trained_models/.
-    candidate = p / ATLAS_NAME
-    if candidate.exists() and any_existing_multiclass_bundle(candidate):
-        return candidate
+    if any_existing_multiclass_bundle(p) and any(
+        (p / atlas / "Release").is_dir()
+        for atlas in ("Hao", "Zhang", "Triana", "Luecken")
+    ):
+        return p
 
-    # Case 3: points to data/.
-    candidate = p / "Pre_trained_models" / ATLAS_NAME
-    if candidate.exists() and any_existing_multiclass_bundle(candidate):
-        return candidate
+    candidates = _models_roots_under(p)
 
-    # Case 4: points to a parent containing the atlas folder somewhere shallow.
-    matches = [m for m in p.glob(f"**/{ATLAS_NAME}") if m.is_dir()]
-    matches = [m for m in matches if any_existing_multiclass_bundle(m)]
-    if matches:
-        matches = sorted(matches, key=lambda x: len(x.parts))
-        return matches[0]
+    # Preserve support for a higher-level parent directory.
+    for match in p.glob(f"**/{ATLAS_NAME}*"):
+        if not match.is_dir():
+            continue
+        if match.name != ATLAS_NAME and _model_date_from_name(match.name) is None:
+            continue
+        if any_existing_multiclass_bundle(match):
+            candidates.append(match.resolve())
 
-    # Case 5: user points to a directory that itself contains Hao/Zhang/etc.
-    if any((p / atlas / "Release").is_dir() for atlas in ("Hao", "Zhang", "Triana", "Luecken")):
-        if any_existing_multiclass_bundle(p):
-            return p
+    selected = _select_models_root(candidates, model_date=requested)
+    if selected is not None:
+        return selected
 
+    expected = _atlas_dir_name(requested) if requested else f"{ATLAS_NAME}_YYMMDD"
     raise FileNotFoundError(
-        "Could not resolve models_path to the atlas root.\n"
-        f"Expected to find a directory named: {ATLAS_NAME}\n"
-        "Expected layout:\n"
-        f"  {ATLAS_NAME}/Hao/Release/Broad/Models/Multiclass_models.joblib\n"
+        "Could not resolve models_path to a usable atlas root.\n"
+        f"Requested release: {requested or 'latest installed'}\n"
+        f"Expected a directory such as: {expected}\n"
         f"Received: {p}"
     )
 
 
 def ensure_models_available(
     *,
-    model_data: Optional[str] = None,
     local_archive: Optional[str] = None,
     force: bool = False,
+    model_date: Optional[str] = None,
 ) -> Path:
     """
-    Ensure models exist; attempt to download if missing.
+    Ensure a model release exists and return its data directory.
 
-    Returns
-    -------
-    Path
-        The data directory that contains either:
-
-            Pre_trained_models/<ATLAS_NAME>/
-
-        or:
-
-            <ATLAS_NAME>/
+    When ``model_date`` is omitted, the newest installed dated release is used.
+    If no dated release is installed, a legacy unversioned installation is used;
+    if no models are installed at all, the newest release published on
+    Hugging Face is downloaded automatically (equivalent to calling
+    ``download_models(model_date="latest")``).
     """
-    # 1) Explicit models location.
+    if model_date is None:
+        model_date = os.environ.get("ESPRESSOPRO_MODEL_DATE")
+    requested = _normalize_model_date(model_date)
+
+    # Explicit model location. It may point to one root or a parent containing
+    # several dated roots.
     env_models = os.environ.get("ESPRESSOPRO_MODELS")
     if env_models:
         p = Path(env_models).expanduser().resolve()
-
         if p.is_dir():
             try:
-                atlas_root = _resolve_models_root(p)
-
-                # Return data directory if atlas root is:
-                #   <data>/Pre_trained_models/<ATLAS_NAME>
-                if atlas_root.name == ATLAS_NAME and atlas_root.parent.name == "Pre_trained_models":
-                    return atlas_root.parent.parent
-
-                # Return parent if atlas root is:
-                #   <data>/<ATLAS_NAME>
-                if atlas_root.name == ATLAS_NAME:
-                    return atlas_root.parent
-
+                root = _resolve_models_root(p, model_date=requested)
+                return _data_dir_from_models_root(root)
             except FileNotFoundError:
                 pass
-
         print(f"[ensure_models_available] ESPRESSOPRO_MODELS set but unusable: {p}")
 
-    # 2) Explicit data location.
+    # Explicit data location.
     env_data = os.environ.get("ESPRESSOPRO_DATA")
     if env_data:
         d = Path(env_data).expanduser().resolve()
-        candidates = [
-            d / "Pre_trained_models" / ATLAS_NAME,
-            d / ATLAS_NAME,
-        ]
-        for candidate in candidates:
-            if any_existing_multiclass_bundle(candidate):
+        if d.is_dir():
+            root = _select_models_root(_models_roots_under(d), model_date=requested)
+            if root is not None:
                 return d
-
         print(f"[ensure_models_available] ESPRESSOPRO_DATA set but models not found under: {d}")
 
-    # 3) Look in common candidate locations.
-    for candidate in _candidate_models_dirs():
-        if any_existing_multiclass_bundle(candidate):
-            if candidate.parent.name == "Pre_trained_models":
-                return candidate.parent.parent
-            return candidate.parent
+    # Common package/repository/user locations.
+    roots = _candidate_models_dirs()
+    selected = _select_models_root(roots, model_date=requested)
+    if selected is not None and not force:
+        selected_date = _model_date_from_name(selected.name) or "unversioned"
+        print(f"[ensure_models_available] Using installed model release: {selected_date}")
+        return _data_dir_from_models_root(selected)
 
-    # 4) Download into package data dir and re-check.
-    data_dir = download_models(model_data=model_data, local_archive=local_archive, force=force)
+    # Download the requested release. If nothing was requested AND nothing is
+    # installed locally, fetch the newest release published on Hugging Face
+    # rather than silently falling back to the unversioned archive.
+    download_date = requested if requested is not None else _LATEST_SENTINEL
+    data_dir = download_models(
+        local_archive=local_archive,
+        force=force,
+        model_date=download_date,
+    )
 
-    for candidate in [
-        data_dir / "Pre_trained_models" / ATLAS_NAME,
-        data_dir / ATLAS_NAME,
-    ]:
-        if any_existing_multiclass_bundle(candidate):
-            return data_dir
-
-    for candidate in _candidate_models_dirs():
-        if any_existing_multiclass_bundle(candidate):
-            if candidate.parent.name == "Pre_trained_models":
-                return candidate.parent.parent
-            return candidate.parent
+    # `requested` (not `download_date`) is used here on purpose: when it is
+    # None, this means "pick the newest installed release", which is exactly
+    # what was just downloaded above.
+    selected = _select_models_root(_models_roots_under(data_dir), model_date=requested)
+    if selected is not None:
+        return data_dir
 
     raise FileNotFoundError(
-        "Models directory not found.\n"
-        f"• Set ESPRESSOPRO_MODELS to …/Pre_trained_models/{ATLAS_NAME}, "
-        f"…/{ATLAS_NAME}, …/Pre_trained_models, or the data directory.\n"
-        "• Or set ESPRESSOPRO_DATA to the parent data directory that contains Pre_trained_models/.\n"
-        "• Or pass explicit paths to generate_predictions(..., models_path=..., data_path=...).\n"
-        "• Or use download_models(local_archive='…')."
+        "Models directory not found after download/extraction.\n"
+        f"Requested model_date: {requested or 'latest installed'}\n"
+        "Set ESPRESSOPRO_MODELS or ESPRESSOPRO_DATA, pass explicit paths to "
+        "generate_predictions(...), or call download_models(local_archive='…')."
     )
 
 
-def get_default_models_path() -> Path:
+def get_default_models_path(*, model_date: Optional[str] = None) -> Path:
     """
-    Return the atlas root:
-
-        .../TotalSeqD_Heme_Oncology_CAT399906
-
-    This may be under either:
-
-        data/Pre_trained_models/<ATLAS_NAME>
-
-    or:
-
-        data/<ATLAS_NAME>
+    Return the exact atlas root for a requested YYMMDD release, or the newest
+    installed dated release when ``model_date`` is omitted.
     """
-    data_dir = ensure_models_available()
+    requested = _normalize_model_date(model_date)
+    data_dir = ensure_models_available(model_date=requested)
+    root = _select_models_root(_models_roots_under(data_dir), model_date=requested)
 
-    candidates = [
-        data_dir / "Pre_trained_models" / ATLAS_NAME,
-        data_dir / ATLAS_NAME,
-    ]
+    if root is None:
+        # The selected installation may live outside the package data directory
+        # through ESPRESSOPRO_MODELS. Search all known roots as a fallback.
+        root = _select_models_root(_candidate_models_dirs(), model_date=requested)
 
-    for candidate in candidates:
-        if any_existing_multiclass_bundle(candidate):
-            return candidate
+    if root is None:
+        raise FileNotFoundError(
+            f"No usable model root found for release {requested or 'latest installed'}."
+        )
 
-    for candidate in _candidate_models_dirs():
-        if any_existing_multiclass_bundle(candidate):
-            return candidate
-
-    raise FileNotFoundError(
-        f"Expected models under {data_dir / 'Pre_trained_models' / ATLAS_NAME} "
-        f"or {data_dir / ATLAS_NAME}, but no Multiclass_models.joblib files were found."
-    )
+    selected_date = _model_date_from_name(root.name) or "unversioned"
+    print(f"[get_default_models_path] Selected model release: {selected_date} ({root})")
+    return root
 
 
-def get_default_data_path() -> Path:
-    """Return the default data directory."""
-    return ensure_models_available()
+def get_default_data_path(*, model_date: Optional[str] = None) -> Path:
+    """Return the data directory containing the selected model release."""
+    return ensure_models_available(model_date=model_date)
 
 
-def get_package_data_path() -> Path:
+def get_package_data_path(*, model_date: Optional[str] = None) -> Path:
     """
     Resolve the package data directory using:
 
@@ -489,6 +568,11 @@ def get_package_data_path() -> Path:
       3) pkg_resources
       4) ./data next to this file
       5) ensure_models_available()
+
+    Parameters
+    ----------
+    model_date
+        Optional model release date in YYMMDD format, e.g. "260720".
     """
     env = os.getenv("ESPRESSOPRO_DATA")
     if env:
@@ -524,7 +608,7 @@ def get_package_data_path() -> Path:
         return repo_data
 
     print("[get_package_data_path] Data directory not found, attempting download...")
-    return ensure_models_available()
+    return ensure_models_available(model_date=model_date)
 
 
 def load_models(
@@ -553,10 +637,10 @@ def load_models(
     models_path
         Path to one of:
 
-            .../TotalSeqD_Heme_Oncology_CAT399906
+            .../TotalSeqD_Heme_Oncology_CAT399906_260720
             .../Pre_trained_models
             .../data
-            .../data/Pre_trained_models/TotalSeqD_Heme_Oncology_CAT399906
+            .../data/Pre_trained_models/TotalSeqD_Heme_Oncology_CAT399906_260720
 
     model_names
         Atlas names to load.
